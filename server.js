@@ -86,55 +86,22 @@ const logger = winston.createLogger({
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- Google Cloud Secret Manager (Optional - Uncomment and configure if needed) ---
-/*
-const { SecretManagerServiceClient } = require('@google-cloud/secret-manager');
-const secretManagerClient = new SecretManagerServiceClient();
-
-async function getSecret(name) {
-    const [version] = await secretManagerClient.accessSecretVersion({
-        name: `projects/${process.env.GCP_PROJECT_ID}/secrets/${name}/versions/latest`,
-    });
-    return version.payload.data.toString('utf8');
-}
-
-// Example usage to load secrets before app starts
-async function loadSecrets() {
-    try {
-        process.env.AT_API_KEY = await getSecret('AT_API_KEY');
-        process.env.AT_USERNAME = await getSecret('AT_USERNAME');
-        // ... load other secrets
-        logger.info('Secrets loaded successfully from Secret Manager.');
-    } catch (error) {
-        logger.error('Failed to load secrets from Secret Manager:', error.message);
-        process.exit(1); // Exit if secrets can't be loaded
-    }
-}
-// You'd call loadSecrets() at the very start of your application
-// before `africastalking` or `Firestore` are initialized if their credentials are in Secret Manager.
-// For this script, we'll stick to .env for now to keep it runnable without complex GCP setup.
-*/
-
-
 // --- Firestore Initialization ---
 const firestore = new Firestore({
     projectId: process.env.GCP_PROJECT_ID,
     keyFilename: process.env.GCP_KEY_FILE, // Make sure this path is correct and accessible
 });
 
-const txCollection = firestore.collection('transactions');
-const errorsCollection = firestore.collection('errors');
+// Separate collections as per requirement
+const transactionsCollection = firestore.collection('transactions'); // For money received
+const salesCollection = firestore.collection('sales');           // For airtime dispatched
+const errorsCollection = firestore.collection('errors');         // For logging errors
+// New: Collection for managing system-wide settings, including float
+const systemSettingsCollection = firestore.collection('systemSettings');
+const AIRTIME_FLOAT_DOC_ID = 'airtimeFloat'; // Fixed ID for the float document
 
 // --- Middleware ---
 app.use(helmet()); // Apply security headers
-
-const corsOptions = {
-    origin: 'https://daima-pay-portal.onrender.com', // Ensure this is your actual frontend URL
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type'],
-};
-app.use(cors(corsOptions));
-app.options('/*splat', cors(corsOptions)); // Handle pre-flight requests
 
 app.use(bodyParser.json({ limit: '1mb' })); // Limit request body size
 
@@ -357,69 +324,138 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
 app.post('/c2b-validation', async (req, res) => {
     const callbackData = req.body;
     const now = new Date().toISOString();
-    const transactionIdentifier = callbackData.TransID || 'N/A'; // Use TransID if available
+    const transactionIdentifier = callbackData.TransID || `C2B_VALIDATION_${Date.now()}`;
 
     logger.info('📞 Received C2B Validation Callback:', { TransID: transactionIdentifier, callback: callbackData });
 
     const { BillRefNumber, TransAmount } = callbackData;
+    const amount = parseFloat(TransAmount);
+    const MIN_AMOUNT = 10.00; // Minimum amount for airtime purchase
 
-    // IMPORTANT: Implement your business validation logic here
-    // For example, check if BillRefNumber (intended topup number) is valid or if it corresponds
-    // to an existing account in your system, or if TransAmount is correct.
+    // --- Validation Checks ---
 
-    // Basic Validation: Check if BillRefNumber is a valid phone number format and carrier.
+    // 1. Basic Phone Number (BillRefNumber) Validation
     if (!BillRefNumber || BillRefNumber.length < 9 || BillRefNumber.length > 15 || isNaN(BillRefNumber)) {
         logger.warn(`⚠️ C2B Validation rejected [TransID: ${transactionIdentifier}]: Invalid BillRefNumber format (${BillRefNumber}).`);
         await errorsCollection.add({
             type: 'C2B_VALIDATION_REJECT',
             subType: 'INVALID_BILLREF_FORMAT',
-            error: `Invalid or malformed BillRefNumber: ${BillRefNumber}`,
+            error: `Invalid or malformed Account Number: ${BillRefNumber}`,
             callbackData: callbackData,
             createdAt: now,
         });
         return res.json({
-            "ResultCode": 1, // 0 for Accept, 1 for Reject
+            "ResultCode": 1, // Reject
             "ResultDesc": "Invalid Account Number format provided."
         });
     }
 
+    // 2. Carrier Detection
     const carrier = detectCarrier(BillRefNumber);
     if (carrier === 'Unknown') {
         logger.warn(`⚠️ C2B Validation rejected [TransID: ${transactionIdentifier}]: Unsupported carrier for BillRefNumber (${BillRefNumber}).`);
         await errorsCollection.add({
             type: 'C2B_VALIDATION_REJECT',
             subType: 'UNSUPPORTED_CARRIER',
-            error: `Unsupported carrier for BillRefNumber: ${BillRefNumber}`,
+            error: `Unsupported carrier for provided Account Number: ${BillRefNumber}`,
             callbackData: callbackData,
             createdAt: now,
         });
         return res.json({
-            "ResultCode": 1,
+            "ResultCode": 1, // Reject
             "ResultDesc": "Unsupported carrier for provided Account Number."
         });
     }
 
-    // Amount validation
-    if (TransAmount <= 0) {
-        logger.warn(`⚠️ C2B Validation rejected [TransID: ${transactionIdentifier}]: Invalid amount (${TransAmount}).`);
+    // 3. Amount Validation (KES 10 and above)
+    if (isNaN(amount) || amount < MIN_AMOUNT) {
+        logger.warn(`⚠️ C2B Validation rejected [TransID: ${transactionIdentifier}]: Invalid amount (${TransAmount}). Must be KES ${MIN_AMOUNT} or more.`);
         await errorsCollection.add({
             type: 'C2B_VALIDATION_REJECT',
-            subType: 'INVALID_AMOUNT',
-            error: `Transaction amount must be greater than zero: ${TransAmount}`,
+            subType: 'INVALID_AMOUNT_TOO_LOW',
+            error: `Transaction amount must be KES ${MIN_AMOUNT} or more: ${TransAmount}`,
             callbackData: callbackData,
             createdAt: now,
         });
         return res.json({
-            "ResultCode": 1,
-            "ResultDesc": "Transaction amount must be greater than zero."
+            "ResultCode": 1, // Reject
+            "ResultDesc": `Transaction amount must be KES ${MIN_AMOUNT} or more.`
         });
     }
-    // Add more validation logic as needed (e.g., min/max amount, service availability)
+
+    // 4. Float Balance Check (Crucial for preventing over-selling)
+    try {
+        const floatDoc = await systemSettingsCollection.doc(AIRTIME_FLOAT_DOC_ID).get();
+        if (!floatDoc.exists) {
+            logger.error(`❌ Float balance document '${AIRTIME_FLOAT_DOC_ID}' not found in 'systemSettings' collection! Rejecting transaction.`);
+            await errorsCollection.add({
+                type: 'C2B_VALIDATION_ERROR',
+                subType: 'FLOAT_DOC_MISSING',
+                error: `Airtime float balance document missing in Firestore.`,
+                callbackData: callbackData,
+                createdAt: now,
+            });
+            return res.json({
+                "ResultCode": 1,
+                "ResultDesc": "Service temporarily unavailable. Please try again later."
+            });
+        }
+
+        const currentFloatBalance = parseFloat(floatDoc.data().currentBalance);
+        if (isNaN(currentFloatBalance)) {
+            logger.error(`❌ Float balance in document '${AIRTIME_FLOAT_DOC_ID}' is not a valid number! Rejecting transaction.`);
+            await errorsCollection.add({
+                type: 'C2B_VALIDATION_ERROR',
+                subType: 'FLOAT_BALANCE_INVALID',
+                error: `Airtime float balance is invalid.`,
+                callbackData: callbackData,
+                createdAt: now,
+            });
+            return res.json({
+                "ResultCode": 1,
+                "ResultDesc": "Service temporarily unavailable. Please try again later."
+            });
+        }
+
+        if (currentFloatBalance < amount) {
+            logger.warn(`⚠️ C2B Validation rejected [TransID: ${transactionIdentifier}]: Insufficient float balance. Current: ${currentFloatBalance}, Needed: ${amount}`);
+            await errorsCollection.add({
+                type: 'C2B_VALIDATION_REJECT',
+                subType: 'INSUFFICIENT_FLOAT',
+                error: `Insufficient airtime float balance. Current: ${currentFloatBalance}, Requested: ${amount}`,
+                callbackData: callbackData,
+                createdAt: now,
+            });
+            return res.json({
+                "ResultCode": 1, // Reject
+                "ResultDesc": "Sorry, unable to process your request due to insufficient airtime float. Please try a smaller amount or check back later."
+            });
+        }
+        logger.info(`✅ Float check passed for TransID ${transactionIdentifier}. Current balance: ${currentFloatBalance}, Request amount: ${amount}.`);
+
+    } catch (error) {
+        logger.error(`❌ Error during float balance check for TransID ${transactionIdentifier}:`, {
+            message: error.message,
+            stack: error.stack,
+            callbackData: callbackData
+        });
+        await errorsCollection.add({
+            type: 'C2B_VALIDATION_ERROR',
+            subType: 'FLOAT_CHECK_EXCEPTION',
+            error: `Failed to check airtime float balance: ${error.message}`,
+            callbackData: callbackData,
+            createdAt: now,
+        });
+        return res.json({
+            "ResultCode": 1, // Reject due to internal error
+            "ResultDesc": "An internal error occurred while validating your request. Please try again later."
+        });
+    }
 
     // If all validation passes, accept the transaction
     logger.info('✅ C2B Validation successful:', { TransID: transactionIdentifier, BillRefNumber: BillRefNumber, Amount: TransAmount });
     res.json({
-        "ResultCode": 0, // 0 for Accept, 1 for Reject
+        "ResultCode": 0, // Accept
         "ResultDesc": "Validation successful."
     });
 });
@@ -428,20 +464,15 @@ app.post('/c2b-validation', async (req, res) => {
 app.post('/c2b-confirmation', async (req, res) => {
     const callbackData = req.body;
     const now = new Date().toISOString();
-    const transactionId = callbackData.TransID; // M-Pesa Transaction ID
+    const transactionId = callbackData.TransID; // M-Pesa Transaction ID (unique identifier for the incoming payment)
 
     logger.info('📞 Received C2B Confirmation Callback:', { TransID: transactionId, callback: callbackData });
 
     // Extract relevant data from callbackData
     const {
-        TransactionType,
         TransTime,
         TransAmount,
-        BusinessShortCode,
-        BillRefNumber,      // This is the Account Number entered by the customer
-        InvoiceNumber,
-        OrgAccountBalance,
-        ThirdPartyTransID,
+        BillRefNumber,      // This is the Account Number entered by the customer (top-up number)
         MSISDN,             // Customer's phone number
         FirstName,
         MiddleName,
@@ -453,85 +484,192 @@ app.post('/c2b-confirmation', async (req, res) => {
     const mpesaNumber = MSISDN;
     const customerName = `${FirstName || ''} ${MiddleName || ''} ${LastName || ''}`.trim();
 
-    let finalTxStatus = 'FAILED';
-    let airtimeResult = null;
-    let errorMessage = null;
+    let saleId = null; // To store the ID of the sales document if created
+    let floatDeducted = false; // Flag to track if float was successfully debited
 
+    // Use a try-catch-finally block to ensure Firestore updates and M-Pesa response
     try {
-        // First, check if this transaction ID has already been processed to prevent duplicates
-        const existingTxDoc = await txCollection.doc(transactionId).get();
+        // --- 1. Record the incoming M-Pesa transaction (money received) ---
+        // Check for duplicate M-Pesa TransID to ensure idempotency
+        const existingTxDoc = await transactionsCollection.doc(transactionId).get();
         if (existingTxDoc.exists) {
             logger.warn(`⚠️ Duplicate C2B confirmation for TransID: ${transactionId}. Skipping processing.`);
             // Acknowledge M-Pesa even if it's a duplicate
             return res.json({ "ResultCode": 0, "ResultDesc": "Duplicate C2B confirmation received and ignored." });
         }
 
-        // Record the initial transaction as PENDING
-        await txCollection.doc(transactionId).set({
-            transactionID: transactionId,
-            date: now,
-            amount: amount,
-            recipient: topupNumber,
-            payer: mpesaNumber,
-            source: 'C2B_OFFLINE', // Indicate it's an offline C2B payment
-            status: 'PENDING_AIRTIME', // Waiting for airtime dispatch
-            mpesaReceiptNumber: transactionId, // For C2B, TransID acts as receipt
-            phoneNumberUsedForPayment: mpesaNumber,
-            customerName: customerName,
-            c2bCallbackData: callbackData, // Store raw callback data for debugging
+        // Record the incoming payment in the transactions collection
+        await transactionsCollection.doc(transactionId).set({
+            transactionID: transactionId, // M-Pesa's unique transaction ID for money received
+            transactionTime: TransTime, // M-Pesa's transaction timestamp
+            amountReceived: amount,
+            payerMsisdn: mpesaNumber,
+            payerName: customerName,
+            billRefNumber: topupNumber, // The account number provided by customer
+            mpesaRawCallback: callbackData, // Store the full callback for audit
+            status: 'RECEIVED_PENDING_SALE', // Initial status for money received
+            createdAt: now,
             lastUpdated: now,
         });
+        logger.info(`✅ Recorded incoming transaction ${transactionId} in 'transactions' collection.`);
 
-        // Determine carrier and send airtime
-        const carrier = detectCarrier(topupNumber);
-        if (carrier === 'Unknown') {
-            errorMessage = `Unsupported carrier prefix for C2B phone number: ${topupNumber}`;
-            logger.error(`❌ ${errorMessage}`, { TransID: transactionId, topupNumber: topupNumber, callback: callbackData });
+
+        // --- 2. Debit Float Balance & Record Airtime Sale attempt ---
+        // Use a Firestore Transaction to safely update the float balance
+        const floatUpdateResult = await firestore.runTransaction(async t => {
+            const floatDocRef = systemSettingsCollection.doc(AIRTIME_FLOAT_DOC_ID);
+            const floatDocSnapshot = await t.get(floatDocRef);
+
+            if (!floatDocSnapshot.exists) {
+                const errorMessage = `Float balance document '${AIRTIME_FLOAT_DOC_ID}' not found during transaction!`;
+                logger.error(`❌ ${errorMessage}`);
+                throw new Error(errorMessage); // This will cause the transaction to fail and retry
+            }
+
+            const currentFloat = parseFloat(floatDocSnapshot.data().currentBalance);
+            if (isNaN(currentFloat)) {
+                const errorMessage = `Float balance in document '${AIRTIME_FLOAT_DOC_ID}' is invalid!`;
+                logger.error(`❌ ${errorMessage}`);
+                throw new Error(errorMessage);
+            }
+
+            if (currentFloat < amount) {
+                const errorMessage = `Insufficient float balance during confirmation for TransID ${transactionId}. Current: ${currentFloat}, Needed: ${amount}`;
+                logger.warn(`⚠️ ${errorMessage}`);
+                return { success: false, reason: 'INSUFFICIENT_FLOAT', message: errorMessage };
+            }
+
+            // If sufficient, debit the float
+            const newFloat = currentFloat - amount;
+            t.update(floatDocRef, { currentBalance: newFloat, lastUpdated: new Date().toISOString() });
+            floatDeducted = true; // Set flag as float was debited
+
+            logger.info(`✅ Debited float balance for TransID ${transactionId}. Old: ${currentFloat}, New: ${newFloat}`);
+            return { success: true, newFloat: newFloat };
+        });
+
+        if (!floatUpdateResult.success) {
+            // Float check failed during confirmation (e.g., race condition, or float went low between validation and confirmation)
+            const errorMessage = floatUpdateResult.message || `Float debit failed for TransID ${transactionId}. Reason: ${floatUpdateResult.reason}`;
+            logger.error(`❌ Float debit failed for TransID ${transactionId}. Reason: ${floatUpdateResult.reason}`);
             await errorsCollection.add({
-                type: 'C2B_AIRTIME_ERROR',
-                subType: 'UNKNOWN_CARRIER',
+                type: 'AIRTIME_SALE_ERROR',
+                subType: floatUpdateResult.reason,
                 error: errorMessage,
+                transactionId: transactionId,
                 callbackData: callbackData,
                 createdAt: now,
             });
-            finalTxStatus = 'FAILED_UNKNOWN_CARRIER';
+
+            // Update transaction record to reflect float issue
+            await transactionsCollection.doc(transactionId).update({
+                status: 'RECEIVED_FLOAT_ISSUE',
+                fulfillmentStatus: 'FAILED_INSUFFICIENT_FLOAT',
+                errorMessage: errorMessage,
+                lastUpdated: now,
+            });
+
+            // Since float debit failed, we don't proceed with airtime dispatch.
+            return res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received, but airtime not dispatched due to float issue." });
+        }
+
+        // If float was successfully debited, proceed with recording the sale and dispatching airtime
+        const saleRef = salesCollection.doc(); // Let Firestore generate a unique ID
+        saleId = saleRef.id; // Store saleId for potential future updates in catch block
+
+        let airtimeDispatchStatus = 'FAILED';
+        let airtimeDispatchResult = null;
+        let saleErrorMessage = null;
+
+        // Initialize sale document
+        await saleRef.set({
+            saleId: saleId,
+            relatedTransactionId: transactionId, 
+            topupNumber: topupNumber,
+            amount: amount,
+            carrier: detectCarrier(topupNumber), // Detect carrier here for sales record
+            status: 'PENDING_DISPATCH', // Initial status for airtime sale
+            dispatchAttemptedAt: now,
+            createdAt: now,
+            lastUpdated: now,
+        });
+        logger.info(`✅ Initialized sale document ${saleId} in 'sales' collection for TransID ${transactionId}.`);
+
+        // --- 3. Attempt to dispatch airtime ---
+        const carrier = detectCarrier(topupNumber); 
+        if (carrier === 'Unknown') {
+            saleErrorMessage = `Unsupported carrier prefix for airtime top-up: ${topupNumber}`;
+            logger.error(`❌ ${saleErrorMessage}`, { TransID: transactionId, saleId: saleId, topupNumber: topupNumber, callback: callbackData });
+            await errorsCollection.add({
+                type: 'AIRTIME_SALE_ERROR',
+                subType: 'UNKNOWN_CARRIER',
+                error: saleErrorMessage,
+                transactionId: transactionId,
+                saleId: saleId,
+                callbackData: callbackData,
+                createdAt: now,
+            });
+            airtimeDispatchStatus = 'FAILED_UNKNOWN_CARRIER';
         } else {
-            logger.info(`📡 Detected Carrier for C2B TransID ${transactionId}: ${carrier}`);
+            logger.info(`📡 Detected Carrier for sale ${saleId} (TransID ${transactionId}): ${carrier}`);
             if (carrier === 'Safaricom') {
-                airtimeResult = await sendSafaricomAirtime(topupNumber, amount);
-            } else { // Airtel, Telkom, Equitel, Faiba via Africa's Talking
-                airtimeResult = await sendAfricasTalkingAirtime(topupNumber, amount, carrier);
+                airtimeDispatchResult = await sendSafaricomAirtime(topupNumber, amount);
+            } else { 
+                airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, amount, carrier);
             }
 
-            if (airtimeResult && airtimeResult.status === 'SUCCESS') {
-                finalTxStatus = 'COMPLETED';
-                logger.info(`✅ Airtime successfully sent for C2B TransID: ${transactionId}`, { airtimeResponse: airtimeResult.data });
+            if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
+                airtimeDispatchStatus = 'COMPLETED';
+                logger.info(`✅ Airtime successfully sent for sale ${saleId} (TransID ${transactionId}).`, { airtimeResponse: airtimeDispatchResult.data });
             } else {
-                errorMessage = airtimeResult ? airtimeResult.error : 'Airtime send failed with no specific error message.';
-                logger.error(`❌ Airtime send failed for C2B TransID ${transactionId}:`, {
-                    error_message: errorMessage,
+                saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'Airtime dispatch failed with no specific error message.';
+                logger.error(`❌ Airtime dispatch failed for sale ${saleId} (TransID ${transactionId}):`, {
+                    error_message: saleErrorMessage,
                     carrier: carrier,
                     topupNumber: topupNumber,
                     amount: amount,
-                    airtimeResponse: airtimeResult,
+                    airtimeResponse: airtimeDispatchResult,
                     callbackData: callbackData,
                 });
                 await errorsCollection.add({
-                    type: 'C2B_AIRTIME_ERROR',
+                    type: 'AIRTIME_SALE_ERROR',
                     subType: `AIRTIME_API_FAIL_${carrier.toUpperCase()}`,
-                    error: errorMessage,
-                    transactionCode: transactionId,
+                    error: saleErrorMessage,
+                    transactionId: transactionId,
+                    saleId: saleId,
                     originalAmount: amount,
-                    airtimeResponse: airtimeResult,
+                    airtimeResponse: airtimeDispatchResult,
                     callbackData: callbackData,
                     createdAt: now,
                 });
-                finalTxStatus = 'FAILED_AIRTIME_DISPATCH';
+                airtimeDispatchStatus = 'FAILED_DISPATCH_API';
+                // REVERSAL LOGIC: If airtime dispatch failed *after* float was debited,
+                logger.warn(`⚠️ Airtime dispatch failed after float debit. Manual reconciliation may be required for TransID ${transactionId}, Sale ${saleId}.`);
             }
         }
+
+        // --- 4. Update the Airtime Sale document with final status ---
+        await saleRef.update({
+            status: airtimeDispatchStatus,
+            dispatchResult: airtimeDispatchResult, 
+            errorMessage: saleErrorMessage,
+            lastUpdated: new Date().toISOString(),
+        });
+        logger.info(`✅ Updated sale ${saleId} to status: ${airtimeDispatchStatus}.`);
+
+        // --- 5. Update the 'transactions' document with fulfillment status ---
+        await transactionsCollection.doc(transactionId).update({
+            linkedSaleId: saleId,
+            fulfillmentStatus: airtimeDispatchStatus, 
+            status: 'RECEIVED_FULFILLED', 
+            lastUpdated: new Date().toISOString(),
+        });
+        logger.info(`✅ Updated transaction ${transactionId} with linked sale ID ${saleId} and fulfillment status.`);
+
+
     } catch (err) {
-        errorMessage = `Processing exception for C2B TransID ${transactionId}: ${err.message}`;
-        logger.error(`❌ ${errorMessage}`, {
+        const generalErrorMessage = `Critical processing exception for C2B TransID ${transactionId}: ${err.message}`;
+        logger.error(`❌ ${generalErrorMessage}`, {
             error: err.message,
             stack: err.stack,
             TransID: transactionId,
@@ -539,39 +677,50 @@ app.post('/c2b-confirmation', async (req, res) => {
         });
         await errorsCollection.add({
             type: 'C2B_PROCESSING_EXCEPTION',
-            error: errorMessage,
+            error: generalErrorMessage,
             stack: err.stack,
             transactionCode: transactionId,
             callbackData: callbackData,
             createdAt: now,
         });
-        finalTxStatus = 'FAILED_SERVER_ERROR';
-    } finally {
-        // Update the transaction document with the final status and airtime result
-        await txCollection.doc(transactionId).update({
-            status: finalTxStatus,
-            airtimeResult: airtimeResult, // Store full airtime API response if available
-            errorMessage: errorMessage,
-            lastUpdated: now,
-            // Add float balance updates here if needed
-        }).catch(updateErr => {
-            logger.error(`❌ Failed to update transaction ${transactionId} in Firestore during finally block:`, {
-                error: updateErr.message,
-                stack: updateErr.stack,
-                transactionCode: transactionId,
-                callbackData: callbackData,
-            });
-            errorsCollection.add({
-                type: 'FIRESTORE_UPDATE_ERROR',
-                error: `Failed to update transaction ${transactionId} after C2B processing: ${updateErr.message}`,
-                transactionCode: transactionId,
-                callbackData: callbackData,
-                createdAt: new Date().toISOString(),
-            });
-        });
 
-        // Always respond with a success code to M-Pesa, even if internal processing failed.
-        // This tells M-Pesa that your server received the callback.
+        try {
+            await transactionsCollection.doc(transactionId).update({
+                status: 'RECEIVED_PROCESSING_ERROR',
+                fulfillmentStatus: 'FAILED_SERVER_ERROR',
+                errorMessage: generalErrorMessage,
+                lastUpdated: new Date().toISOString(),
+            });
+        } catch (updateErr) {
+            logger.error(`❌ Failed to update transaction ${transactionId} with processing error:`, { error: updateErr.message, stack: updateErr.stack });
+        }
+        if (saleId) {
+            try {
+                await salesCollection.doc(saleId).update({
+                    status: 'FAILED_SERVER_ERROR',
+                    errorMessage: generalErrorMessage,
+                    lastUpdated: new Date().toISOString(),
+                });
+            } catch (updateErr) {
+                logger.error(`❌ Failed to update sale ${saleId} with processing error:`, { error: updateErr.message, stack: updateErr.stack });
+            }
+        }
+
+        // If float was debited but airtime failed due to an exception, this is a REVERSAL SCENARIO
+        if (floatDeducted) {
+             logger.warn(`⚠️ CRITICAL: Float was debited for TransID ${transactionId} but airtime dispatch failed due to an exception. Manual float reversal or reconciliation may be required.`);
+             await errorsCollection.add({
+                type: 'FLOAT_RECONCILIATION_WARNING',
+                subType: 'FLOAT_DEBITED_BUT_DISPATCH_FAILED',
+                error: `Float debited but airtime dispatch failed unexpectedly for TransID ${transactionId}.`,
+                transactionId: transactionId,
+                saleId: saleId,
+                amount: amount,
+                createdAt: now,
+             });
+        }
+
+    } finally {
         res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received by DaimaPay server." });
     }
 });
@@ -616,5 +765,4 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
     logger.info(`🚀 C2B Server running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode.`);
     logger.info('Make sure NODE_ENV is set to "production" in your deployment environment.');
-    logger.info(`CORS origin allowed: ${corsOptions.origin}`);
 });
