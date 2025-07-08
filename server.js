@@ -2,669 +2,418 @@ require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
-const admin = require('firebase-admin'); // For Firestore
+const africastalking = require('africastalking')({
+    apiKey: process.env.AT_API_KEY,
+    username: process.env.AT_USERNAME,
+});
+const { Firestore } = require('@google-cloud/firestore');
 const cors = require('cors');
-
-// --- Firebase Admin SDK Initialization ---
-try {
-  const serviceAccountJsonString = process.env.GCP_SERVICE_ACCOUNT_KEY_B64 
-    ? Buffer.from(process.env.GCP_SERVICE_ACCOUNT_KEY_B64, 'base64').toString('utf8')
-    : process.env.GCP_SERVICE_ACCOUNT_KEY_JSON;
-  
-  const serviceAccount = JSON.parse(serviceAccountJsonString);
-
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    projectId: process.env.GCP_PROJECT_ID,
-  });
-
-  console.log('[Firebase] Admin SDK initialized successfully.');
-} catch (error) {
-  console.error('[Firebase] ERROR initializing Admin SDK:', error.message);
-  console.error('[Firebase] Ensure GCP_SERVICE_ACCOUNT_KEY_B64 or GCP_SERVICE_ACCOUNT_KEY_JSON is a valid JSON string.');
-  process.exit(1);
-}
-
-const firestore = admin.firestore();
-
-const transactionsCollection = firestore.collection('transactions');
-const salesCollection = firestore.collection('sales');
-const errorsCollection = firestore.collection('errors');
-const floatCollection = firestore.collection('float_balances');
-const configAirtimeNetworksCollection = firestore.collection('config_airtime_networks');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS configuration
+const firestore = new Firestore({
+    projectId: process.env.GCP_PROJECT_ID,
+    keyFilename: process.env.GCP_KEY_FILE,
+});
+
+// Using a single collection for transactions, good.
+const txCollection = firestore.collection('transactions');
+const errorsCollection = firestore.collection('errors'); // Added for more robust error logging
+
 const corsOptions = {
-  origin: 'https://daima-pay-portal.onrender.com', 
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
+    origin: 'https://daima-pay-portal.onrender.com', // Ensure this is your actual frontend URL
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type'],
 };
 
 app.use(cors(corsOptions));
-app.options('/*splat', cors(corsOptions)); 
+app.options('/*splat', cors(corsOptions)); // Handle pre-flight requests
 app.use(bodyParser.json());
 
-// --- Global Caches for M-Pesa Airtime Token ---
 let cachedAirtimeToken = null;
 let tokenExpiryTimestamp = 0;
 
-// Africa's Talking SDK Initialization (already present)
-const africastalking = require('africastalking')({
-  apiKey: process.env.AT_API_KEY,
-  username: process.env.AT_USERNAME,
-});
-
-
-// --- Helper Functions (Copied from offline server for consistency) ---
-
+// Carrier detection helper
 function detectCarrier(phoneNumber) {
-  const normalized = phoneNumber.replace(/^(\+254|254)/, '0').trim();
-  const prefix3 = normalized.substring(1, 4); // after '0'
-  const safaricom = new Set([
-    '110', '111', '112', '113', '114', '115', '116', '117', '118', '119',
-    ...range(701, 709),
-    ...range(710, 719),
-    ...range(720, 729),
-    '740', '741', '742', '743', '745', '746', '748',
-    '757', '758', '759', '768',
-    ...range(790, 799)
-  ]);
-  const airtel = new Set([
-    '100', '101', '102',
-    ...range(730, 739),
-    ...range(750, 756),
-    ...range(780, 789)
-  ]);
-  const telkom = new Set(range(770, 779));
-  const equitel = new Set(['763', '764', '765', '766']);
-  const faiba = new Set(['747']);
+    const normalized = phoneNumber.replace(/^(\+254|254)/, '0').trim();
+    // Ensure the number is 9 digits after '0'
+    if (normalized.length !== 10 || !normalized.startsWith('0')) {
+        return 'Unknown';
+    }
+    const prefix3 = normalized.substring(1, 4); // after '0'
 
-  if (safaricom.has(prefix3)) return 'Safaricom';
-  if (airtel.has(prefix3)) return 'Airtel';
-  if (telkom.has(prefix3)) return 'Telkom';
-  if (equitel.has(prefix3)) return 'Equitel';
-  if (faiba.has(prefix3)) return 'Faiba';
-  return 'Unknown';
+    const safaricom = new Set([
+        '110', '111', '112', '113', '114', '115', '116', '117', '118', '119', // 07xx -> 011x
+        '701', '702', '703', '704', '705', '706', '707', '708', '709',
+        '710', '711', '712', '713', '714', '715', '716', '717', '718', '719',
+        '720', '721', '722', '723', '724', '725', '726', '727', '728', '729',
+        '740', '741', '742', '743', '745', '746', '748',
+        '757', '758', '759',
+        '768',
+        '790', '791', '792', '793', '794', '795', '796', '797', '798', '799'
+    ]);
+    const airtel = new Set([
+        '100', '101', '102', // 010x
+        '730', '731', '732', '733', '734', '735', '736', '737', '738', '739',
+        '750', '751', '752', '753', '754', '755', '756',
+        '780', '781', '782', '783', '784', '785', '786', '787', '788', '789'
+    ]);
+    const telkom = new Set([
+        '770', '771', '772', '773', '774', '775', '776', '777', '778', '779'
+    ]);
+    // Added Equitel and Faiba (assuming common prefixes) - You might need to verify these.
+    const equitel = new Set([
+        '764', '765', '766', '767',
+        '769', // Some sources list 0769
+    ]);
+    const faiba = new Set([
+        '747',
+    ]);
 
-  function range(a, b) {
-    const arr = [];
-    for (let i = a; i <= b; i++) arr.push(String(i));
-    return arr;
-  }
+
+    if (safaricom.has(prefix3)) return 'Safaricom';
+    if (airtel.has(prefix3)) return 'Airtel';
+    if (telkom.has(prefix3)) return 'Telkom';
+    if (equitel.has(prefix3)) return 'Equitel'; // Added Equitel
+    if (faiba.has(prefix3)) return 'Faiba';     // Added Faiba
+    return 'Unknown';
 }
 
-function normalizePhoneForCarrier(phoneNumber, carrier) {
-  let phone = String(phoneNumber).trim();
-  if (!phone) {
-    throw new Error("Phone number is empty or invalid.");
-  }
-
-  if (carrier.toLowerCase() === 'safaricom') {
-    if (phone.startsWith('254')) {
-      phone = '0' + phone.slice(3);
-    } else if (phone.startsWith('+254')) {
-      phone = '0' + phone.slice(4);
-    }
-    if (!phone.startsWith('0')) {
-      phone = '0' + phone;
-    }
-    return phone;
-  } else if (['airtel', 'telkom', 'faiba', 'equitel'].includes(carrier.toLowerCase())) {
-    if (phone.startsWith('+254')) {
-      return phone;
-    } else if (phone.startsWith('0')) {
-      return '+254' + phone.slice(1);
-    } else if (phone.startsWith('254')) {
-      return '+' + phone;
-    } else {
-      if (phone.length === 9 && (phone.startsWith('7') || phone.startsWith('1'))) {
-         return '+254' + phone;
-      }
-      throw new Error(`Africa's Talking recipients must start with +254, 254, or 0. Received: ${phoneNumber}`);
-    }
-  }
-  return phone;
-}
-
+// ✅ Safaricom dealer token
 async function getCachedAirtimeToken() {
-  const now = Date.now();
-  if (cachedAirtimeToken && now < tokenExpiryTimestamp) {
-    console.log('🔑 [M-Pesa Token] Using cached dealer token');
-    return cachedAirtimeToken;
-  }
-
-  console.log('🔄 [M-Pesa Token] Fetching new dealer token...');
-  // Ensure consistent environment variable names
-  const auth = Buffer.from(`${process.env.MPESA_AIRTIME_CONSUMER_KEY}:${process.env.MPESA_AIRTIME_CONSUMER_SECRET}`).toString('base64');
-
-  try {
-    const response = await axios.post(
-      process.env.MPESA_GRANT_URL,
-      {},
-      {
-        headers: {
-          Authorization: `Basic ${auth}`,
-          'Content-Type': 'application/json',
-        },
-      }
-    );
-    const token = response.data.access_token;
-    cachedAirtimeToken = token;
-    tokenExpiryTimestamp = now + 3599 * 1000;
-    console.log('✅ [M-Pesa Token] New dealer token acquired.');
-    return token;
-  } catch (error) {
-    console.error('❌ [M-Pesa Token] Failed to get dealer token:', error.response ? error.response.data : error.message);
-    throw new Error('Failed to acquire M-Pesa airtime dealer token.');
-  }
-}
-
-async function getCarrierBonus(carrier, amount) {
-    console.log(`[getCarrierBonus] Fetching bonus for ${carrier} with amount ${amount}`);
+    const now = Date.now();
+    if (cachedAirtimeToken && now < tokenExpiryTimestamp) {
+        console.log('🔑 Using cached dealer token');
+        return cachedAirtimeToken;
+    }
     try {
-        const docRef = configAirtimeNetworksCollection.doc(carrier.toLowerCase());
-        const doc = await docRef.get();
-
-        if (doc.exists) {
-            const data = doc.data();
-            const commissionRate = Number(data.commission_rate) || 0;
-            const bonus = parseFloat((amount * commissionRate).toFixed(2));
-            console.log(`[getCarrierBonus] Found ${carrier} commission rate: ${commissionRate}, calculated bonus: ${bonus}`);
-            return { bonus, commission_rate: commissionRate };
-        } else {
-            console.warn(`[getCarrierBonus] No configuration found for carrier: ${carrier}. Returning 0 bonus.`);
-            return { bonus: 0, commission_rate: 0 };
-        }
+        const auth = Buffer.from(`${process.env.MPESA_AIRTIME_KEY}:${process.env.MPESA_AIRTIME_SECRET}`).toString('base64');
+        const response = await axios.post(
+            process.env.MPESA_GRANT_URL,
+            {},
+            {
+                headers: {
+                    Authorization: `Basic ${auth}`,
+                    'Content-Type': 'application/json',
+                },
+            }
+        );
+        const token = response.data.access_token;
+        cachedAirtimeToken = token;
+        tokenExpiryTimestamp = now + 3599 * 1000; // Token expires in 1 hour (3600 seconds)
+        console.log('✅ Fetched new dealer token.');
+        return token;
     } catch (error) {
-        console.error(`❌ [getCarrierBonus] Error fetching bonus for ${carrier}:`, error.message);
-        return { bonus: 0, commission_rate: 0 }; // Default to no bonus on error
+        console.error('❌ Failed to get Safaricom airtime token:', error.response ? error.response.data : error.message);
+        throw new Error('Failed to obtain Safaricom airtime token.');
     }
 }
 
-async function sendSafaricomAirtime(receiverNumber, amount) {
-  const { bonus, commission_rate } = await getCarrierBonus('Safaricom', amount);
-  const totalAmount = parseFloat((amount + bonus).toFixed(2));
-
-  console.log(`[Safaricom Airtime] Base Amount: ${amount}, Bonus: ${bonus}, Total Amount for Top-up: ${totalAmount}`);
-
-  const token = await getCachedAirtimeToken();
-  const normalizedReceiver = normalizePhoneForCarrier(receiverNumber, 'Safaricom');
-  const adjustedAmount = totalAmount * 100;
-
-  if (!process.env.DEALER_SENDER_MSISDN || !process.env.DEALER_SERVICE_PIN || !process.env.MPESA_AIRTIME_URL) {
-      console.error('[Safaricom Airtime] Missing environment variables for dealer API.');
-      throw new Error('Missing Safaricom dealer API configuration.');
-  }
-
-  const body = {
-    senderMsisdn: process.env.DEALER_SENDER_MSISDN,
-    amount: adjustedAmount,
-    servicePin: process.env.DEALER_SERVICE_PIN,
-    receiverMsisdn: normalizedReceiver,
-  };
-
-  console.log('[Safaricom Airtime] Sending dealer airtime request to:', process.env.MPESA_AIRTIME_URL);
-  console.log('Request Body (masked servicePin):', { ...body, servicePin: '*****' });
-
-  try {
-    const response = await axios.post(
-      process.env.MPESA_AIRTIME_URL,
-      body,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-      }
-    );
-    console.log('✅ [Safaricom Airtime] Dealer airtime API response:', response.data);
-    return {
-        ...response.data,
-        bonus,
-        commission_rate,
-        total_sent_to_api: totalAmount
-    };
-  } catch (error) {
-    console.error('❌ [Safaricom Airtime] Dealer airtime send failed:', error.response ? error.response.data : error.message);
-    throw new Error(`Safaricom airtime send failed: ${error.response ? JSON.stringify(error.response.data) : error.message}`);
-  }
+function normalizeReceiverPhoneNumber(num) {
+    // Ensures the number starts with 0 and is 10 digits long.
+    let normalized = num.replace(/^(\+254|254)/, '0').trim();
+    if (normalized.startsWith('0') && normalized.length === 10) {
+        return normalized;
+    }
+    // If it's 7xx or 1xx, prepend 0
+    if (normalized.length === 9 && !normalized.startsWith('0')) {
+        return `0${normalized}`;
+    }
+    // Return as is if it doesn't fit common Kenyan formats for now,
+    // carrier detection should catch it if invalid.
+    return num;
 }
 
-async function sendAfricasTalkingAirtime(receiverNumber, amount, carrier) {
-    const { bonus, commission_rate } = await getCarrierBonus(carrier, amount);
-    const totalAmount = parseFloat((amount + bonus).toFixed(2));
-
-    console.log(`[Africa's Talking] Base Amount: ${amount}, Bonus: ${bonus}, Total Amount for Top-up: ${totalAmount}`);
-
-    const formattedAmount = `KES ${totalAmount}`;
-    const normalizedPhone = normalizePhoneForCarrier(receiverNumber, carrier);
-
-    console.log(`[Africa's Talking] Sending airtime to ${normalizedPhone} (${carrier}) for ${formattedAmount}`);
-
+// ✅ Send Safaricom dealer airtime
+async function sendSafaricomAirtime(receiverNumber, amount) {
     try {
-        const response = await africastalking.AIRTIME.send({
-            recipients: [{ phoneNumber: normalizedPhone, amount: formattedAmount }],
-        });
-        console.log('✅ [Africa\'s Talking] Airtime sent:', response);
+        const token = await getCachedAirtimeToken();
+        const normalizedReceiver = normalizeReceiverPhoneNumber(receiverNumber);
+        // Safaricom Airtime API expects amount in cents, so multiply by 100
+        const adjustedAmount = Math.round(amount * 100); 
 
-        if (response && response.responses && response.responses.length > 0 && response.responses[0].status === 'Sent') {
+        const body = {
+            senderMsisdn: process.env.DEALER_SENDER_MSISDN,
+            amount: adjustedAmount,
+            servicePin: process.env.DEALER_SERVICE_PIN,
+            receiverMsisdn: normalizedReceiver,
+        };
+
+        const response = await axios.post(
+            process.env.MPESA_AIRTIME_URL,
+            body,
+            {
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                },
+            }
+        );
+
+        console.log('✅ Safaricom dealer airtime API response:', response.data);
+        return {
+            status: 'SUCCESS',
+            message: 'Safaricom airtime sent',
+            data: response.data,
+        };
+    } catch (error) {
+        console.error('❌ Safaricom dealer airtime send failed:', error.response ? error.response.data : error.message);
+        return {
+            status: 'FAILED',
+            message: 'Safaricom airtime send failed',
+            error: error.response ? error.response.data : error.message,
+        };
+    }
+}
+
+// Function to send Africa's Talking Airtime
+async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
+    try {
+        const result = await africastalking.AIRTIME.send({
+            recipients: [{ phoneNumber: normalizeReceiverPhoneNumber(phoneNumber), amount: `KES ${amount}` }],
+        });
+        console.log(`✅ Africa's Talking airtime sent to ${carrier}:`, result);
+        // AT response structure varies, typically check result.responses[0].status
+        if (result && result.responses && result.responses.length > 0 && result.responses[0].status === 'Success') {
             return {
                 status: 'SUCCESS',
-                message: 'Airtime sent successfully via Africa\'s Talking',
-                atResponse: response,
-                bonus,
-                commission_rate,
-                total_sent_to_api: totalAmount
+                message: 'Africa\'s Talking airtime sent',
+                data: result,
             };
         } else {
-            const errorMessage = (response && response.responses && response.responses[0] && response.responses[0].errorMessage) ||
-                                 (response && response.errorMessage) ||
-                                 'Africa\'s Talking API error (unspecified)';
-            throw new Error(errorMessage);
+            console.error(`❌ Africa's Talking airtime send indicates non-success status:`, result);
+            return {
+                status: 'FAILED',
+                message: 'Africa\'s Talking airtime send failed or not successful.',
+                error: result,
+            };
         }
     } catch (error) {
-        console.error('❌ [Africa\'s Talking] Airtime send failed:', error.message || error);
-        throw new Error(`Africa's Talking airtime send failed: ${error.message || JSON.stringify(error)}`);
-    }
-}
-
-async function updateFloatBalance(carrier, amount, transactionId, status, type = 'debit') {
-    const floatDocRef = floatCollection.doc(carrier.toLowerCase());
-
-    try {
-        await firestore.runTransaction(async (t) => {
-            const doc = await t.get(floatDocRef);
-
-            let currentBalance = 0;
-            if (doc.exists) {
-                currentBalance = doc.data().balance || 0;
-            }
-
-            let newBalance = currentBalance;
-            if (status === 'COMPLETED' && type === 'debit') {
-                newBalance = currentBalance - parseFloat(amount);
-            }
-
-            t.set(floatDocRef, {
-                balance: newBalance,
-                lastUpdate: admin.firestore.FieldValue.serverTimestamp(),
-                lastTransactionId: transactionId,
-                lastTransactionAmount: parseFloat(amount),
-                lastTransactionStatus: status,
-                lastTransactionType: type,
-            }, { merge: true });
-
-            console.log(`✅ [Float] Updated ${carrier} float: ${currentBalance} -> ${newBalance}`);
-        });
-    } catch (error) {
-        console.error(`❌ [Float] Failed to update float balance for ${carrier}:`, error.message);
-        // Log this float update failure to errors collection
-        await errorsCollection.doc(`FLOAT_UPDATE_ERROR_${transactionId}_${Date.now()}`).set({
-          type: 'FLOAT_UPDATE_ERROR',
-          transactionId: transactionId,
-          carrier: carrier,
-          amount: amount,
-          status: status,
-          error: error.message,
-          stack: error.stack,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+        console.error(`❌ Africa's Talking airtime send failed for ${carrier} (exception caught):`, error.message);
+        return {
+            status: 'FAILED',
+            message: 'Africa\'s Talking airtime send failed (exception)',
+            error: error.message,
+        };
     }
 }
 
 
-// --- API Endpoints ---
+// --- C2B (Offline Paybill) Callbacks ---
 
-// STK Push Payment Initiation
-app.post('/pay', async (req, res) => {
-  const { topupNumber, amount, mpesaNumber } = req.body;
-  const now = admin.firestore.FieldValue.serverTimestamp();
+// C2B Validation Endpoint (Optional but Recommended)
+app.post('/c2b-validation', async (req, res) => {
+    const callbackData = req.body;
+    const now = new Date().toISOString();
 
-  if (!topupNumber || !amount || !mpesaNumber) {
-    // Log error to errorsCollection
-    await errorsCollection.add({
-      type: 'STKPUSH_INIT_ERROR',
-      error: 'Missing required fields for STK Push initiation.',
-      requestBody: req.body,
-      createdAt: now,
-    });
-    return res.status(400).json({ error: 'Missing fields! All fields are required.' });
-  }
+    console.log('📞 Received C2B Validation Callback:', JSON.stringify(callbackData));
 
-  if (isNaN(amount) || parseFloat(amount) <= 0) {
-    // Log error to errorsCollection
-    await errorsCollection.add({
-      type: 'STKPUSH_INIT_ERROR',
-      error: `Invalid amount provided: ${amount}. Amount must be a positive number.`,
-      requestBody: req.body,
-      createdAt: now,
-    });
-    return res.status(400).json({ error: 'Invalid amount. Amount must be a positive number.' });
-  }
+    // Extract relevant data from callbackData
+    const {
+        TransactionType,
+        TransID,
+        TransTime,
+        TransAmount,
+        BusinessShortCode,
+        BillRefNumber, // This is the Account Number entered by the customer
+        InvoiceNumber,
+        OrgAccountBalance,
+        ThirdPartyTransID,
+        MSISDN,
+        FirstName,
+        MiddleName,
+        LastName,
+    } = callbackData;
 
-  const carrier = detectCarrier(topupNumber);
-  console.log(`📡 Detected Carrier for ${topupNumber}: ${carrier}`);
+    // IMPORTANT: Implement your business validation logic here
+    // For example, check if BillRefNumber (intended topup number) is valid or if it corresponds
+    // to an existing account in your system, or if TransAmount is within acceptable limits.
 
-  if (carrier === 'Unknown') {
-    // Log error to errorsCollection
-    await errorsCollection.add({
-      type: 'STKPUSH_INIT_ERROR',
-      error: `Unsupported carrier prefix for phone number: ${topupNumber}.`,
-      requestBody: req.body,
-      createdAt: now,
-    });
-    return res.status(400).json({ error: 'Unsupported carrier prefix. Please check the top-up number.' });
-  }
+    // Example Validation: If BillRefNumber is "INVALID", reject the transaction.
+    // In a real scenario, you'd check if `BillRefNumber` is a valid phone number or order ID.
+    if (!BillRefNumber || detectCarrier(BillRefNumber) === 'Unknown') {
+        console.warn(`⚠️ C2B Validation rejected: Invalid or missing BillRefNumber (${BillRefNumber})`);
+        await errorsCollection.add({
+            type: 'C2B_VALIDATION_REJECT',
+            error: 'Invalid or missing BillRefNumber (Account Number) provided.',
+            callbackData: callbackData,
+            createdAt: now,
+        });
+        // Respond to M-Pesa to reject the transaction
+        return res.json({
+            "ResultCode": 1, // 0 for Accept, 1 for Reject
+            "ResultDesc": "Invalid Account Number (BillRefNumber) provided."
+        });
+    }
 
-  try {
-    const auth = Buffer.from(
-      `${process.env.DARAJA_CONSUMER_KEY}:${process.env.DARAJA_CONSUMER_SECRET}`
-    ).toString('base64');
+    // You could also check if the amount is reasonable, etc.
+    if (TransAmount <= 0) {
+        console.warn(`⚠️ C2B Validation rejected: Invalid amount (${TransAmount})`);
+        await errorsCollection.add({
+            type: 'C2B_VALIDATION_REJECT',
+            error: 'Transaction amount must be greater than zero.',
+            callbackData: callbackData,
+            createdAt: now,
+        });
+        return res.json({
+            "ResultCode": 1,
+            "ResultDesc": "Transaction amount must be greater than zero."
+        });
+    }
 
-    const authResponse = await axios.get(
-      'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
-      {
-        headers: { Authorization: `Basic ${auth}` },
-      }
-    );
-
-    const access_token = authResponse.data.access_token;
-
-    const timestamp = new Date().toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
-    const password = Buffer.from(
-      `${process.env.BUSINESS_SHORTCODE}${process.env.DARAJA_PASSKEY}${timestamp}`
-    ).toString('base64');
-
-    const stkPushPayload = {
-      BusinessShortCode: process.env.BUSINESS_SHORTCODE,
-      Password: password,
-      Timestamp: timestamp,
-      TransactionType: 'CustomerPayBillOnline',
-      Amount: parseFloat(amount), 
-      PartyA: mpesaNumber,
-      PartyB: process.env.TILL_SHORTCODE, 
-      PhoneNumber: mpesaNumber,
-      CallBackURL: `${process.env.BASE_URL}/stk-callback`, 
-      AccountReference: 'DaimaPayAirtime', 
-      TransactionDesc: 'Airtime Purchase',
-    };
-
-    const stkResponse = await axios.post(
-      'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
-      stkPushPayload,
-      {
-        headers: {
-          Authorization: `Bearer ${access_token}`,
-        },
-      }
-    );
-
-    console.log('✅ STK Push Initiated Response:', stkResponse.data);
-
-    const checkoutRequestID = stkResponse.data.CheckoutRequestID;
-    const merchantRequestId = stkResponse.data.MerchantRequestID;
-
-    // --- Store initial transaction in both collections ---
-    // 1. transactionsCollection (minimal)
-    await transactionsCollection.doc(checkoutRequestID).set({
-      date: now,
-      transactionID: checkoutRequestID,
-      amount: parseFloat(amount),
-      recipient: topupNumber,
-      source: 'ONLINE_STK',
-      status: 'PENDING',
-    });
-    console.log(`📈 [transactions] Initial record for ${checkoutRequestID} created.`);
-
-    // 2. salesCollection
-    await salesCollection.doc(checkoutRequestID).set({
-      date: now,
-      customerName: `Online User (${mpesaNumber})`, 
-      phone: mpesaNumber, 
-      carrier,
-      status: 'PENDING',
-      transactionCode: checkoutRequestID, 
-      originalAmountPaid: parseFloat(amount),
-      stkPushInitiationResponse: stkResponse.data, 
-      stkPushPayload: stkPushPayload, 
-      merchantRequestId: merchantRequestId,
-      topupNumber: topupNumber, 
-      lastUpdated: now,
-    });
-    console.log(`📈 [sales] Initial record for ${checkoutRequestID} created.`);
-
+    // If all validation passes, accept the transaction
+    console.log('✅ C2B Validation successful.');
     res.json({
-      message: `STK push initiated for ${carrier}. Please complete the payment on your phone.`,
-      CheckoutRequestID: checkoutRequestID,
+        "ResultCode": 0, // 0 for Accept, 1 for Reject
+        "ResultDesc": "Validation successful."
     });
-
-  } catch (err) {
-    console.error('❌ STK Push Error:', err.response ? err.response.data : err.message);
-    let errorMessage = 'STK push failed. An unexpected error occurred.';
-    if (err.response && err.response.data && err.response.data.errorMessage) {
-        errorMessage = err.response.data.errorMessage;
-    } else if (err.message) {
-        errorMessage = err.message;
-    }
-
-    // Log error to errorsCollection
-    await errorsCollection.add({
-      type: 'STKPUSH_INIT_FAILURE',
-      error: errorMessage,
-      requestBody: req.body,
-      mpesaApiResponse: err.response ? err.response.data : null,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    res.status(500).json({ error: errorMessage });
-  }
 });
 
-// M-Pesa STK Callback Handler
-app.post('/stk-callback', async (req, res) => {
-  const callback = req.body;
-  const now = admin.firestore.FieldValue.serverTimestamp();
+// C2B Confirmation Endpoint (Mandatory)
+app.post('/c2b-confirmation', async (req, res) => {
+    const callbackData = req.body;
+    const now = new Date().toISOString();
 
-  console.log('📞 Received STK Callback:', JSON.stringify(callback));
+    console.log('📞 Received C2B Confirmation Callback:', JSON.stringify(callbackData));
 
-  const resultCode = callback.Body.stkCallback.ResultCode;
-  const checkoutRequestID = callback.Body.stkCallback.CheckoutRequestID;
-  const mpesaReceiptNumber = callback.Body.stkCallback.CallbackMetadata?.Item.find(item => item.Name === 'MpesaReceiptNumber')?.Value || null;
-  const transactionDateFromMpesa = callback.Body.stkCallback.CallbackMetadata?.Item.find(item => item.Name === 'TransactionDate')?.Value || null;
-  const phoneNumberUsedForPayment = callback.Body.stkCallback.CallbackMetadata?.Item.find(item => item.Name === 'PhoneNumber')?.Value || null;
+    // Extract relevant data from callbackData
+    const {
+        TransactionType,
+        TransID,            // M-Pesa Transaction ID
+        TransTime,
+        TransAmount,
+        BusinessShortCode,
+        BillRefNumber,      // This is the Account Number entered by the customer
+        InvoiceNumber,
+        OrgAccountBalance,
+        ThirdPartyTransID,
+        MSISDN,             // Customer's phone number
+        FirstName,
+        MiddleName,
+        LastName,
+    } = callbackData;
 
+    // Use TransID as the document ID to prevent duplicates and make it easily searchable
+    const transactionId = TransID;
+    const topupNumber = BillRefNumber; // Assuming BillRefNumber is the number to top up
+    const amount = parseFloat(TransAmount);
+    const mpesaNumber = MSISDN;
+    const customerName = `${FirstName || ''} ${MiddleName || ''} ${LastName || ''}`.trim();
 
-  const txDocRef = transactionsCollection.doc(checkoutRequestID);
-  const txDoc = await txDocRef.get();
+    let finalTxStatus = 'FAILED';
+    let airtimeResult = null;
+    let errorMessage = null;
 
-  if (!txDoc.exists) {
-    console.error('❌ No matching transaction for CheckoutRequestID in Firestore:', checkoutRequestID);
-    // Log this critical error
-    await errorsCollection.doc(`STK_CALLBACK_NO_TX_${checkoutRequestID}_${Date.now()}`).set({
-      type: 'STK_CALLBACK_ERROR',
-      error: 'No matching transaction found in transactionsCollection for CheckoutRequestID.',
-      checkoutRequestID: checkoutRequestID,
-      callbackData: callback,
-      createdAt: now,
-    });
-    return res.json({ resultCode: 0, resultDesc: 'No matching transaction found locally for this callback.' });
-  }
-
-  const txData = txDoc.data();
-  const { topupNumber, amount: originalAmount, carrier, payer } = txData; 
-
-  let finalTxStatus = 'FAILED'; 
-  let finalSalesStatus = 'FAILED'; 
-  let airtimeResult = null;
-  let bonusAmount = 0;
-  let commissionRate = 0;
-  let totalSentAmount = originalAmount;
-
-
-  if (resultCode === 0) {
-    // M-Pesa payment was successful
     try {
-      if (carrier === 'Safaricom' || ['Airtel', 'Telkom', 'Faiba', 'Equitel'].includes(carrier)) {
-        const bonusData = await getCarrierBonus(carrier, originalAmount);
-        bonusAmount = bonusData.bonus;
-        commissionRate = bonusData.commission_rate;
-        totalSentAmount = parseFloat((originalAmount + bonusAmount).toFixed(2));
-
-        if (carrier === 'Safaricom') {
-          airtimeResult = await sendSafaricomAirtime(topupNumber, originalAmount); // Pass original amount, function handles bonus
-          if (airtimeResult && airtimeResult.responseStatus === '200') {
-            finalTxStatus = 'SUCCESS';
-            finalSalesStatus = 'COMPLETED';
-          } else {
-            console.error(`❌ Safaricom airtime send indicates non-200 status:`, airtimeResult);
-            // Log specific error
-            await errorsCollection.doc(`SAF_API_FAIL_${checkoutRequestID}`).set({
-              type: 'AIRTIME_SEND_ERROR',
-              subType: 'SAFARICOM_API_FAILURE',
-              error: `Safaricom API returned non-200 status: ${JSON.stringify(airtimeResult)}`,
-              transactionCode: checkoutRequestID,
-              originalAmount: originalAmount,
-              airtimeResponse: airtimeResult,
-              callbackData: callback,
-              createdAt: now,
-            });
-          }
-        } else { // Africa's Talking carriers
-          airtimeResult = await sendAfricasTalkingAirtime(topupNumber, originalAmount, carrier); // Pass original amount
-          if (airtimeResult && airtimeResult.status === 'SUCCESS') {
-            finalTxStatus = 'SUCCESS';
-            finalSalesStatus = 'COMPLETED';
-          } else {
-            console.error(`❌ Africa's Talking airtime send indicates non-SUCCESS status:`, airtimeResult);
-            // Log specific error
-            await errorsCollection.doc(`AT_API_FAIL_${checkoutRequestID}`).set({
-              type: 'AIRTIME_SEND_ERROR',
-              subType: 'AFRICASTALKING_API_FAILURE',
-              error: `Africa's Talking API returned non-SUCCESS status: ${JSON.stringify(airtimeResult)}`,
-              transactionCode: checkoutRequestID,
-              originalAmount: originalAmount,
-              airtimeResponse: airtimeResult,
-              callbackData: callback,
-              createdAt: now,
-            });
-          }
+        // First, check if this transaction ID has already been processed to prevent duplicates
+        const existingTxDoc = await txCollection.doc(transactionId).get();
+        if (existingTxDoc.exists) {
+            console.warn(`⚠️ Duplicate C2B confirmation for TransID: ${transactionId}. Skipping processing.`);
+            // Acknowledge M-Pesa even if it's a duplicate
+            return res.json({ "ResultCode": 0, "ResultDesc": "Duplicate C2B confirmation received and ignored." });
         }
-      } else {
-        console.warn(`⚠️ Airtime top-up not supported for carrier: ${carrier}.`);
-        airtimeResult = { error: 'Unsupported carrier for airtime top-up.' };
-        // Log specific error
-        await errorsCollection.doc(`UNSUPPORTED_CARRIER_ONLINE_${checkoutRequestID}`).set({
-          type: 'AIRTIME_SEND_ERROR',
-          subType: 'UNSUPPORTED_CARRIER',
-          error: `Airtime top-up not supported for carrier: ${carrier}.`,
-          transactionCode: checkoutRequestID,
-          callbackData: callback,
-          createdAt: now,
+
+        // Record the initial transaction as PENDING
+        await txCollection.doc(transactionId).set({
+            transactionID: transactionId,
+            date: now,
+            amount: amount,
+            recipient: topupNumber,
+            payer: mpesaNumber,
+            source: 'C2B_OFFLINE', // Indicate it's an offline C2B payment
+            status: 'PENDING_AIRTIME', // Waiting for airtime dispatch
+            mpesaReceiptNumber: transactionId, // For C2B, TransID acts as receipt
+            phoneNumberUsedForPayment: mpesaNumber,
+            customerName: customerName,
+            c2bCallbackData: callbackData, // Store raw callback data for debugging
+            lastUpdated: now,
         });
-      }
 
-      // Update float balance ONLY if airtime send was COMPLETED
-      if (finalSalesStatus === 'COMPLETED') {
-        await updateFloatBalance(carrier, totalSentAmount, checkoutRequestID, 'COMPLETED', 'debit');
-      }
+        // Determine carrier and send airtime
+        const carrier = detectCarrier(topupNumber);
+        if (carrier === 'Unknown') {
+            errorMessage = `Unsupported carrier prefix for C2B phone number: ${topupNumber}`;
+            console.error(`❌ ${errorMessage}`);
+            await errorsCollection.add({
+                type: 'C2B_AIRTIME_ERROR',
+                subType: 'UNKNOWN_CARRIER',
+                error: errorMessage,
+                callbackData: callbackData,
+                createdAt: now,
+            });
+            finalTxStatus = 'FAILED_UNKNOWN_CARRIER';
+        } else {
+            console.log(`📡 Detected Carrier for C2B: ${carrier}`);
+            if (carrier === 'Safaricom') {
+                airtimeResult = await sendSafaricomAirtime(topupNumber, amount);
+            } else { // Airtel, Telkom, Equitel, Faiba via Africa's Talking
+                airtimeResult = await sendAfricasTalkingAirtime(topupNumber, amount, carrier);
+            }
 
+            if (airtimeResult && airtimeResult.status === 'SUCCESS') {
+                finalTxStatus = 'COMPLETED';
+                console.log(`✅ Airtime successfully sent for C2B TransID: ${transactionId}`);
+            } else {
+                errorMessage = airtimeResult ? airtimeResult.error : 'Airtime send failed with no specific error message.';
+                console.error(`❌ Airtime send failed for C2B TransID ${transactionId}:`, errorMessage);
+                await errorsCollection.add({
+                    type: 'C2B_AIRTIME_ERROR',
+                    subType: `AIRTIME_API_FAIL_${carrier.toUpperCase()}`,
+                    error: errorMessage,
+                    transactionCode: transactionId,
+                    originalAmount: amount,
+                    airtimeResponse: airtimeResult,
+                    callbackData: callbackData,
+                    createdAt: now,
+                });
+                finalTxStatus = 'FAILED_AIRTIME_DISPATCH';
+            }
+        }
     } catch (err) {
-      console.error('❌ Airtime send failed (exception caught):', err.message);
-      // Log critical error
-      await errorsCollection.doc(`AIRTIME_EXCEPTION_ONLINE_${checkoutRequestID}`).set({
-        type: 'AIRTIME_SEND_ERROR',
-        subType: 'RUNTIME_EXCEPTION',
-        error: err.message,
-        stack: err.stack,
-        transactionCode: checkoutRequestID,
-        callbackData: callback,
-        createdAt: now,
-      });
-    }
-  } else {
-    // M-Pesa payment failed or was cancelled by user
-    console.log(`❌ Payment failed for ${checkoutRequestID}. ResultCode: ${resultCode}, Desc: ${callback.Body.stkCallback.ResultDesc}`);
-    finalTxStatus = 'FAILED';
-    finalSalesStatus = 'FAILED';
-
-    // Log payment failure to errors collection
-    await errorsCollection.doc(`STK_PAYMENT_FAILED_${checkoutRequestID}`).set({
-      type: 'STK_PAYMENT_ERROR',
-      error: `STK Payment failed or was cancelled. ResultCode: ${resultCode}, ResultDesc: ${callback.Body.stkCallback.ResultDesc}`,
-      checkoutRequestID: checkoutRequestID,
-      callbackData: callback,
-      createdAt: now,
-    });
-  }
-
-  // --- Final Updates to Firestore ---
-  await transactionsCollection.doc(checkoutRequestID).update({
-    status: finalTxStatus,
-    lastUpdated: now,
-  });
-  console.log(`✅ [transactions] Final status for ${checkoutRequestID} updated to: ${finalTxStatus}`);
-
-  // 2. Update 'sales' collection (detailed final record)
-  await salesCollection.doc(checkoutRequestID).update({
-    status: finalSalesStatus,
-    airtimeResult: airtimeResult,
-    completedAt: now,
-    lastUpdated: now,
-    bonus: bonusAmount,
-    commission_rate: commissionRate,
-    total_sent: totalSentAmount,
-    mpesaReceiptNumber: mpesaReceiptNumber,
-    balanceAfterPayment: callback.Body.stkCallback.CallbackMetadata?.Item.find(item => item.Name === 'Balance')?.Value || null,
-    transactionDateFromMpesa: transactionDateFromMpesa,
-    phoneNumberUsedForPayment: phoneNumberUsedForPayment,
-    resultCode: resultCode,
-    resultDesc: callback.Body.stkCallback.ResultDesc,
-    errorDetails: (finalSalesStatus === 'FAILED' && airtimeResult && airtimeResult.error) ? airtimeResult.error : null,
-  });
-  console.log(`✅ [sales] Final status for ${checkoutRequestID} updated to: ${finalSalesStatus}`);
-  res.json({ resultCode: 0, resultDesc: 'Callback received and processed by DaimaPay server.' });
-});
-
-
-app.get('/transaction-status/:checkoutRequestID', async (req, res) => {
-    const { checkoutRequestID } = req.params;
-    try {
-        const txDoc = await transactionsCollection.doc(checkoutRequestID).get();
-
-        if (!txDoc.exists) {
-            console.warn(`Attempted to fetch status for non-existent CheckoutRequestID: ${checkoutRequestID}`);
-            return res.status(404).json({ error: 'Transaction not found.' });
-        }
-
-        const data = txDoc.data();
-        const createdAtISO = data.date ? data.date.toDate().toISOString() : null; 
-        const completedAtISO = data.lastUpdated ? data.lastUpdated.toDate().toISOString() : null;
-
-        res.json({
-            status: data.status,
-            completedAt: completedAtISO,
-            createdAt: createdAtISO,
-            transactionID: data.transactionID,
-            amount: data.amount,
-            recipient: data.recipient, 
-            source: data.source,
+        errorMessage = `Processing error for C2B TransID ${transactionId}: ${err.message}`;
+        console.error(`❌ ${errorMessage}`, err);
+        await errorsCollection.add({
+            type: 'C2B_PROCESSING_EXCEPTION',
+            error: errorMessage,
+            stack: err.stack,
+            transactionCode: transactionId,
+            callbackData: callbackData,
+            createdAt: now,
         });
-    } catch (error) {
-        console.error('Error fetching transaction status for:', checkoutRequestID, error);
-        res.status(500).json({ error: 'Failed to fetch transaction status.' });
+        finalTxStatus = 'FAILED_SERVER_ERROR';
+    } finally {
+        // Update the transaction document with the final status and airtime result
+        await txCollection.doc(transactionId).update({
+            status: finalTxStatus,
+            airtimeResult: airtimeResult,
+            errorMessage: errorMessage,
+            lastUpdated: now,
+            // You might want to add float balance updates here, similar to your old script's salesCollection logic
+        }).catch(updateErr => {
+            console.error(`❌ Failed to update transaction ${transactionId} in Firestore:`, updateErr.message);
+            errorsCollection.add({
+                type: 'FIRESTORE_UPDATE_ERROR',
+                error: `Failed to update transaction ${transactionId} after C2B processing: ${updateErr.message}`,
+                transactionCode: transactionId,
+                callbackData: callbackData,
+                createdAt: new Date().toISOString(),
+            });
+        });
+
+        // Always respond with a success code to M-Pesa, even if internal processing failed.
+        // This tells M-Pesa that your server received the callback.
+        res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received by DaimaPay server." });
     }
 });
 
 
-// Default route for health check
+// Health check endpoint
 app.get('/', (req, res) => {
-  res.send('DaimaPay backend is live ✅');
+    res.send('DaimaPay C2B backend is live ✅');
 });
 
 // Start the server
 app.listen(PORT, () => {
-  console.log(`🚀 Web server running on port ${PORT}`);
+    console.log(`🚀 C2B Server running on port ${PORT}`);
 });
