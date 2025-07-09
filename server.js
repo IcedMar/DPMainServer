@@ -202,10 +202,10 @@ async function getCachedAirtimeToken() {
 function normalizeReceiverPhoneNumber(num) {
     let normalized = String(num).replace(/^(\+254|254)/, '0').trim();
     if (normalized.startsWith('0') && normalized.length === 10) {
-        return normalized;
+        return normalized.slice(1);
     }
     if (normalized.length === 9 && !normalized.startsWith('0')) {
-        return `${normalized}`;
+        return `${normalized.slice(1)}`;
     }
     logger.warn(`Phone number could not be normalized to 07XXXXXXXX format: ${num}`);
     return num;
@@ -229,8 +229,7 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
             servicePin: process.env.DEALER_SERVICE_PIN,
             receiverMsisdn: normalizedReceiver,
         };
-        
-        logger.info('Safaricom dealer payload:', body);
+
         const response = await axios.post(
             process.env.MPESA_AIRTIME_URL,
             body,
