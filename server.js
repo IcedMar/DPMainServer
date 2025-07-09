@@ -122,6 +122,20 @@ app.use('/c2b-validation', c2bLimiter);
 let cachedAirtimeToken = null;
 let tokenExpiryTimestamp = 0;
 
+//service pin
+async function generateServicePin(rawPin) {
+  console.log('[generateServicePin] subscriberNumber:', rawPin);
+  try {
+    const encodedPin = btoa(rawPin);
+    console.log('[generateServicePin] encodedPin:', encodedPin);
+    return encodedPin;
+  } catch (error) {
+    console.error('[generateServicePin] error:', error);
+    throw new Error(`Service PIN generation failed: ${error.message}`);
+  }
+}
+
+
 // Carrier detection helper
 function detectCarrier(phoneNumber) {
     const normalized = phoneNumber.replace(/^(\+254|254)/, '0').trim();
@@ -217,6 +231,7 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
         const token = await getCachedAirtimeToken();
         const normalizedReceiver = normalizeReceiverPhoneNumber(receiverNumber);
         const adjustedAmount = Math.round(amount * 100);
+        const servicePin = await generateServicePin(process.env.DEALER_SERVICE_PIN);
 
         if (!process.env.DEALER_SENDER_MSISDN || !process.env.DEALER_SERVICE_PIN || !process.env.MPESA_AIRTIME_URL) {
             logger.error('Missing Safaricom Dealer API environment variables.');
@@ -226,7 +241,7 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
         const body = {
             senderMsisdn: process.env.DEALER_SENDER_MSISDN,
             amount: adjustedAmount,
-            servicePin: process.env.DEALER_SERVICE_PIN,
+            servicePin: servicePin,
             receiverMsisdn: normalizedReceiver,
         };
 
