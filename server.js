@@ -223,14 +223,14 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
             return { status: 'FAILED', message: 'Missing Safaricom Dealer API credentials.' };
         }
 
-        logger.info('Safaricom dealer payload:', body);
         const body = {
             senderMsisdn: process.env.DEALER_SENDER_MSISDN,
             amount: adjustedAmount,
             servicePin: process.env.DEALER_SERVICE_PIN,
             receiverMsisdn: normalizedReceiver,
         };
-
+        
+        logger.info('Safaricom dealer payload:', body);
         const response = await axios.post(
             process.env.MPESA_AIRTIME_URL,
             body,
