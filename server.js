@@ -278,17 +278,40 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
     }
 }
 
+
 // Function to send Africa's Talking Airtime
 async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
+
+    // Normalize phone for Africa's Talking (+2547... or +2541...)
+  let normalizedPhone = phoneNumber;
+    if (phoneNumber.startsWith('0')) {
+        normalizedPhone = '+254' + phoneNumber.slice(1);
+    } else if (phoneNumber.startsWith('254')) {
+        normalizedPhone = '+' + phoneNumber;
+    } else if (!phoneNumber.startsWith('+254')) {
+        console.error('[sendAfricasTalkingAirtime] Invalid phone format:', phoneNumber);
+        return {
+            status: 'FAILED',
+            message: 'Invalid phone number format for Africa\'s Talking',
+            transaction_id: transactionId,
+            details: {
+            error: 'Phone must start with +254, 254, or 0'
+            }
+        };
+    }
     try {
         if (!process.env.AT_API_KEY || !process.env.AT_USERNAME) {
             logger.error('Missing Africa\'s Talking API environment variables.');
             return { status: 'FAILED', message: 'Missing Africa\'s Talking credentials.' };
         }
         const result = await africastalking.AIRTIME.send({
-            recipients: [{ phoneNumber: normalizeReceiverPhoneNumber(phoneNumber), amount: `KES ${amount}` }],
+            recipients: [
+                { 
+                phoneNumber: normalizedPhone, 
+                amount: `KES ${amount}` 
+            }],
         });
-        logger.info(`✅ Africa's Talking airtime sent to ${carrier}:`, { recipient: phoneNumber, amount: amount, at_response: result });
+        logger.info(`✅ Africa's Talking airtime sent to ${carrier}:`, { recipient: normalizedPhone, amount: amount, at_response: result });
 
         if (result && result.responses && result.responses.length > 0 && result.responses[0].status === 'Success') {
             return {
