@@ -228,6 +228,7 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
             amount: adjustedAmount,
             servicePin: process.env.DEALER_SERVICE_PIN,
             receiverMsisdn: normalizedReceiver,
+            DESC: '0020',
         };
         
         logger.info('Safaricom dealer payload:', body);
