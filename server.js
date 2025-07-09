@@ -228,7 +228,6 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
             amount: adjustedAmount,
             servicePin: process.env.DEALER_SERVICE_PIN,
             receiverMsisdn: normalizedReceiver,
-            DESC: process.env.DEALER_DESC,
         };
 
         const response = await axios.post(
