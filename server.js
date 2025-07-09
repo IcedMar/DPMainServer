@@ -205,7 +205,7 @@ function normalizeReceiverPhoneNumber(num) {
         return normalized;
     }
     if (normalized.length === 9 && !normalized.startsWith('0')) {
-        return `0${normalized}`;
+        return `${normalized}`;
     }
     logger.warn(`Phone number could not be normalized to 07XXXXXXXX format: ${num}`);
     return num;
