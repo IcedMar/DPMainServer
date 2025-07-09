@@ -308,7 +308,8 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
             recipients: [
                 { 
                 phoneNumber: normalizedPhone, 
-                amount: `KES ${amount}` 
+                amount: `KES ${amount}`,
+                currencyCode: 'KES'
             }],
         });
         logger.info(`✅ Africa's Talking airtime sent to ${carrier}:`, { recipient: normalizedPhone, amount: amount, at_response: result });
