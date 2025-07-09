@@ -308,7 +308,7 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
             recipients: [
                 { 
                 phoneNumber: normalizedPhone, 
-                amount: `KES ${amount}`,
+                amount: amount,
                 currencyCode: 'KES'
             }],
         });
