@@ -2,16 +2,13 @@ require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
-const africastalking = require('africastalking')({
-    apiKey: process.env.AT_API_KEY,
-    username: process.env.AT_USERNAME,
-});
+const crypto = require('crypto');
 const { Firestore } = require('@google-cloud/firestore');
 const cors = require('cors');
-const helmet = require('helmet'); // Security middleware
-const rateLimit = require('express-rate-limit'); // Rate limiting middleware
-const winston = require('winston'); // For structured logging
-require('winston-daily-rotate-file'); // For log file rotation
+const helmet = require('helmet'); 
+const rateLimit = require('express-rate-limit'); 
+const winston = require('winston'); 
+require('winston-daily-rotate-file'); 
 
 // --- Global Error Handlers (VERY IMPORTANT FOR PRODUCTION) ---
 process.on('uncaughtException', (err) => {
@@ -80,6 +77,12 @@ const logger = winston.createLogger({
     transports: transports,
 });
 
+// Function to hash sensitive data like MSISDN
+function hashString(str) {
+    if (!str) return null;
+    return crypto.createHash('sha256').update(str).digest('hex');
+}
+
 // --- Express App Setup ---
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -93,9 +96,6 @@ const firestore = new Firestore({
 const transactionsCollection = firestore.collection('transactions');
 const salesCollection = firestore.collection('sales');
 const errorsCollection = firestore.collection('errors');
-
-// --- Firestore References for Float Management (Adjusted to match your frontend's structure) ---
-// These now point to your 'Saf_float/current' and 'AT_Float/current' documents
 const safaricomFloatDocRef = firestore.collection('Saf_float').doc('current');
 const africasTalkingFloatDocRef = firestore.collection('AT_Float').doc('current');
 
@@ -256,11 +256,29 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
             }
         );
 
+        let safaricomInternalTransId = null;
+        let newSafaricomFloatBalance = null;
+
+        if (response.data && response.data.responseDesc) {
+
+            const desc = response.data.responseDesc;
+            const idMatch = desc.match(/^(R\d{6}\.\d{4}\.\d{6})/);
+
+            if (idMatch && idMatch[1]) {
+                safaricomInternalTransId = idMatch[1];
+            }
+            const balanceMatch = desc.match(/New balance is Ksh\. (\d+\.\d{2})/);
+            if (balanceMatch && balanceMatch[1]) {
+                newSafaricomFloatBalance = parseFloat(balanceMatch[1]);
+            }
+        }
         logger.info('✅ Safaricom dealer airtime API response:', { receiver: normalizedReceiver, amount: amount, response_data: response.data });
         return {
             status: 'SUCCESS',
             message: 'Safaricom airtime sent',
             data: response.data,
+            safaricomInternalTransId: safaricomInternalTransId,
+            newSafaricomFloatBalance: newSafaricomFloatBalance,
         };
     } catch (error) {
         logger.error('❌ Safaricom dealer airtime send failed:', {
@@ -280,9 +298,12 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
 
 
 // Function to send Africa's Talking Airtime
-async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
+const africastalking = require('africastalking')({
+    apiKey: process.env.AT_API_KEY,
+    username: process.env.AT_USERNAME,
+});
 
-    // Normalize phone for Africa's Talking (+2547... or +2541...)
+async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
   let normalizedPhone = phoneNumber;
     if (phoneNumber.startsWith('0')) {
         normalizedPhone = '+254' + phoneNumber.slice(1);
@@ -309,7 +330,7 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
                 { 
                 phoneNumber: normalizedPhone, 
                 amount: amount,
-                currencyCode: 'KES'
+                currencyCode: 'KES' 
             }],
         });
         logger.info(`✅ Africa's Talking airtime sent to ${carrier}:`, { recipient: normalizedPhone, amount: amount, at_response: result });
@@ -349,11 +370,10 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
 
 /**
  * Updates the float balance for a specific carrier.
- * Uses a transaction to ensure atomic update.
- * @param {string} carrierLogicalName The logical name of the float (e.g., 'safaricomFloat', 'africasTalkingFloat').
- * @param {number} amount The amount to add or subtract (negative for debit, positive for credit).
- * @returns {Promise<object>} An object indicating success and the new balance.
- * @throws {Error} If the transaction fails or float is insufficient.
+ * @param {string} 
+ * @param {number} 
+ * @returns {Promise<object>} 
+ * @throws {Error} 
  */
 async function updateCarrierFloatBalance(carrierLogicalName, amount) {
     return firestore.runTransaction(async t => {
@@ -404,14 +424,14 @@ async function updateCarrierFloatBalance(carrierLogicalName, amount) {
 // C2B Validation Endpoint (Optional but Recommended)
 app.post('/c2b-validation', async (req, res) => {
     const callbackData = req.body;
-    const now = new Date().toISOString();
+    const now = new Date();
     const transactionIdentifier = callbackData.TransID || `C2B_VALIDATION_${Date.now()}`;
 
     logger.info('📞 Received C2B Validation Callback:', { TransID: transactionIdentifier, callback: callbackData });
 
     const { TransAmount } = callbackData;
     const amount = parseFloat(TransAmount);
-    const MIN_AMOUNT = 10.00; // Minimum amount for airtime purchase
+    const MIN_AMOUNT = 5.00; // Minimum amount for airtime purchase
 
     // --- Validation Check: Amount KES 10 and above ---
     if (isNaN(amount) || amount < MIN_AMOUNT) {
@@ -440,7 +460,7 @@ app.post('/c2b-validation', async (req, res) => {
 // C2B Confirmation Endpoint (Mandatory)
 app.post('/c2b-confirmation', async (req, res) => {
     const callbackData = req.body;
-    const now = new Date().toISOString();
+    const now = new Date();
     const transactionId = callbackData.TransID;
 
     logger.info('📞 Received C2B Confirmation Callback:', { TransID: transactionId, callback: callbackData });
@@ -600,9 +620,39 @@ app.post('/c2b-confirmation', async (req, res) => {
             airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, amount, targetCarrier);
         }
 
+        const updateSaleFields = {
+            lastUpdated: new Date(), // Use native Date object for Timestamp
+            dispatchResult: airtimeDispatchResult.data || airtimeDispatchResult.error || airtimeDispatchResult, // Store raw API response/error
+        };
+
         if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
             airtimeDispatchStatus = 'COMPLETED';
             logger.info(`✅ Airtime successfully sent for sale ${saleId} (TransID ${transactionId}).`, { airtimeResponse: airtimeDispatchResult.data });
+            updateSaleFields.status = airtimeDispatchStatus;
+        } 
+        // Safaricom Specific Reconciliation
+        if (airtimeDispatchResult.newSafaricomFloatBalance !== null){
+            try{
+                //directly update sadaricom float with balance report
+                await safaricomFloatDocRef.update({
+                    balance: airtimeDispatchResult.newSafaricomFloatBalance,
+                    lastUpdated: new Date()
+                });
+                logger.info(`✅ Safaricom float balance directly updated from API response for TransID ${transactionId}. New balance: ${airtimeDispatchResult.newSafaricomFloatBalance}`);
+            } catch (floatUpdateErr) {
+                logger.error(`❌ Failed to directly update Safaricom float from API response for TransID ${transactionId}:`, {
+                    error: floatUpdateErr.message, reportedBalance: airtimeDispatchResult.newSafaricomFloatBalance
+                });
+                await errorsCollection.add({
+                    type: 'FLOAT_RECONCILIATION_WARNING',
+                    subType: 'SAFARICOM_REPORTED_BALANCE_UPDATE_FAILED',
+                    error: `Failed to update Safaricom float with reported balance: ${floatUpdateErr.message}`,
+                    transactionId: transactionId,
+                    saleId: saleId,
+                    reportedBalance: airtimeDispatchResult.newSafaricomFloatBalance,
+                    createdAt: new Date(),
+                });
+            }
         } else {
             saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'Airtime dispatch failed with no specific error message.';
             logger.error(`❌ Airtime dispatch failed for sale ${saleId} (TransID ${transactionId}):`, {
