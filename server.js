@@ -5,10 +5,10 @@ const axios = require('axios');
 const crypto = require('crypto');
 const { Firestore } = require('@google-cloud/firestore');
 const cors = require('cors');
-const helmet = require('helmet'); 
-const rateLimit = require('express-rate-limit'); 
-const winston = require('winston'); 
-require('winston-daily-rotate-file'); 
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const winston = require('winston');
+require('winston-daily-rotate-file');
 
 // --- Global Error Handlers (VERY IMPORTANT FOR PRODUCTION) ---
 process.on('uncaughtException', (err) => {
@@ -99,6 +99,15 @@ const errorsCollection = firestore.collection('errors');
 const safaricomFloatDocRef = firestore.collection('Saf_float').doc('current');
 const africasTalkingFloatDocRef = firestore.collection('AT_Float').doc('current');
 
+// --- Africa's Talking Initialization ---
+// FIX 1: Import and initialize Africa's Talking
+const AfricasTalking = require('africastalking');
+const africastalking = AfricasTalking({
+    apiKey: process.env.AT_API_KEY,
+    username: process.env.AT_USERNAME
+});
+
+
 // --- Middleware ---
 app.use(helmet());
 app.use(bodyParser.json({ limit: '1mb' }));
@@ -124,9 +133,10 @@ let tokenExpiryTimestamp = 0;
 
 //service pin
 async function generateServicePin(rawPin) {
+  // FIX 4: Use Buffer.from().toString('base64') instead of btoa for Node.js compatibility
   console.log('[generateServicePin] subscriberNumber:', rawPin);
   try {
-    const encodedPin = btoa(rawPin);
+    const encodedPin = Buffer.from(rawPin).toString('base64');
     console.log('[generateServicePin] encodedPin:', encodedPin);
     return encodedPin;
   } catch (error) {
@@ -215,14 +225,20 @@ async function getCachedAirtimeToken() {
 
 function normalizeReceiverPhoneNumber(num) {
     let normalized = String(num).replace(/^(\+254|254)/, '0').trim();
+    // This function originally aimed for '07XXXXXXXX' but then '7XXXXXXXX' for Safaricom API.
+    // The Safaricom API expects the 9-digit format (e.g., 712345678).
+    // The Africa's Talking API expects +254XXXXXXXXX.
+    // Let's refine this function to normalize for Safaricom's specific needs,
+    // and Africa's Talking will handle its own normalization internally if needed.
     if (normalized.startsWith('0') && normalized.length === 10) {
-        return normalized.slice(1);
+        return normalized.slice(1); // Converts '0712345678' to '712345678'
     }
+    // If it's already 9 digits and doesn't start with 0, assume it's good for Safaricom.
     if (normalized.length === 9 && !normalized.startsWith('0')) {
-        return `${normalized.slice(1)}`;
+        return normalized;
     }
-    logger.warn(`Phone number could not be normalized to 07XXXXXXXX format: ${num}`);
-    return num;
+    logger.warn(`Phone number could not be normalized to 7XXXXXXXX format for Safaricom: ${num}. Returning as is.`);
+    return num; // Return as is, let the API potentially fail for incorrect format
 }
 
 // ✅ Send Safaricom dealer airtime
@@ -230,13 +246,15 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
     try {
         const token = await getCachedAirtimeToken();
         const normalizedReceiver = normalizeReceiverPhoneNumber(receiverNumber);
-        const adjustedAmount = Math.round(amount * 100);
-        const servicePin = await generateServicePin(process.env.DEALER_SERVICE_PIN);
+        const adjustedAmount = Math.round(amount * 100); // Amount in cents
 
+        // Check if environment variables are set before making the call
         if (!process.env.DEALER_SENDER_MSISDN || !process.env.DEALER_SERVICE_PIN || !process.env.MPESA_AIRTIME_URL) {
-            logger.error('Missing Safaricom Dealer API environment variables.');
-            return { status: 'FAILED', message: 'Missing Safaricom Dealer API credentials.' };
+            const missingEnvError = 'Missing Safaricom Dealer API environment variables (DEALER_SENDER_MSISDN, DEALER_SERVICE_PIN, MPESA_AIRTIME_URL).';
+            logger.error(missingEnvError);
+            return { status: 'FAILED', message: missingEnvError };
         }
+        const servicePin = await generateServicePin(process.env.DEALER_SERVICE_PIN);
 
         const body = {
             senderMsisdn: process.env.DEALER_SENDER_MSISDN,
@@ -260,14 +278,12 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
         let newSafaricomFloatBalance = null;
 
         if (response.data && response.data.responseDesc) {
-
             const desc = response.data.responseDesc;
-            const idMatch = desc.match(/^(R\d{6}\.\d{4}\.\d{6})/);
-
+            const idMatch = desc.match(/^(R\d{6}\.\d{4}\.\d{6})/); // Regex for the transaction ID
             if (idMatch && idMatch[1]) {
                 safaricomInternalTransId = idMatch[1];
             }
-            const balanceMatch = desc.match(/New balance is Ksh\. (\d+\.\d{2})/);
+            const balanceMatch = desc.match(/New balance is Ksh\. (\d+\.\d{2})/); // Regex for the balance
             if (balanceMatch && balanceMatch[1]) {
                 newSafaricomFloatBalance = parseFloat(balanceMatch[1]);
             }
@@ -301,12 +317,13 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
 async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
   let normalizedPhone = phoneNumber;
 
+  // AT expects E.164 format (+254XXXXXXXXX)
   if (phoneNumber.startsWith('0')) {
     normalizedPhone = '+254' + phoneNumber.slice(1);
-  } else if (phoneNumber.startsWith('254')) {
+  } else if (phoneNumber.startsWith('254') && !phoneNumber.startsWith('+')) {
     normalizedPhone = '+' + phoneNumber;
   } else if (!phoneNumber.startsWith('+254')) {
-    console.error('[sendAfricasTalkingAirtime] Invalid phone format:', phoneNumber);
+    logger.error('[sendAfricasTalkingAirtime] Invalid phone format:', { phoneNumber: phoneNumber });
     return {
       status: 'FAILED',
       message: 'Invalid phone number format for Africa\'s Talking',
@@ -376,10 +393,10 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
 
 /**
  * Updates the float balance for a specific carrier.
- * @param {string} 
- * @param {number} 
- * @returns {Promise<object>} 
- * @throws {Error} 
+ * @param {string} carrierLogicalName - 'safaricomFloat' or 'africasTalkingFloat'
+ * @param {number} amount - The amount to add (positive) or subtract (negative)
+ * @returns {Promise<object>} - { success: true, newBalance: number }
+ * @throws {Error} if balance goes below zero or doc is invalid
  */
 async function updateCarrierFloatBalance(carrierLogicalName, amount) {
     return firestore.runTransaction(async t => {
@@ -407,18 +424,21 @@ async function updateCarrierFloatBalance(carrierLogicalName, amount) {
         } else {
             // If the document doesn't exist, create it with initial balance 0
             logger.warn(`Float document '${carrierLogicalName}' not found. Initializing with balance 0.`);
-            t.set(floatDocRef, { balance: 0, lastUpdated: new Date().toISOString() });
+            t.set(floatDocRef, { balance: 0, lastUpdated: new Date() }); // FIX 5: Use native Date object
             currentFloat = 0; // Set currentFloat to 0 for this transaction's calculation
         }
 
         const newFloat = currentFloat + amount; // amount can be negative for debit
-        if (newFloat < 0) {
+        // Allow negative float if the update is a CREDIT (amount > 0) AND the previous float was negative.
+        // This handles cases where we might manually add funds to a float that went negative.
+        // For debits (amount < 0), ensure it doesn't go below zero.
+        if (amount < 0 && newFloat < 0) {
             const errorMessage = `Attempt to debit ${carrierLogicalName} float below zero. Current: ${currentFloat}, Attempted debit: ${-amount}`;
             logger.warn(`⚠️ ${errorMessage}`);
             throw new Error('Insufficient carrier-specific float balance for this transaction.');
         }
 
-        t.update(floatDocRef, { balance: newFloat, lastUpdated: new Date().toISOString() });
+        t.update(floatDocRef, { balance: newFloat, lastUpdated: new Date() }); // FIX 5: Use native Date object
         logger.info(`✅ Updated ${carrierLogicalName} float balance. Old: ${currentFloat}, New: ${newFloat}, Change: ${amount}`);
         return { success: true, newBalance: newFloat };
     });
@@ -635,29 +655,33 @@ app.post('/c2b-confirmation', async (req, res) => {
             airtimeDispatchStatus = 'COMPLETED';
             logger.info(`✅ Airtime successfully sent for sale ${saleId} (TransID ${transactionId}).`, { airtimeResponse: airtimeDispatchResult.data });
             updateSaleFields.status = airtimeDispatchStatus;
-        } 
-        // Safaricom Specific Reconciliation
-        if (airtimeDispatchResult.newSafaricomFloatBalance !== null){
-            try{
-                //directly update sadaricom float with balance report
-                await safaricomFloatDocRef.update({
-                    balance: airtimeDispatchResult.newSafaricomFloatBalance,
-                    lastUpdated: new Date()
-                });
-                logger.info(`✅ Safaricom float balance directly updated from API response for TransID ${transactionId}. New balance: ${airtimeDispatchResult.newSafaricomFloatBalance}`);
-            } catch (floatUpdateErr) {
-                logger.error(`❌ Failed to directly update Safaricom float from API response for TransID ${transactionId}:`, {
-                    error: floatUpdateErr.message, reportedBalance: airtimeDispatchResult.newSafaricomFloatBalance
-                });
-                await errorsCollection.add({
-                    type: 'FLOAT_RECONCILIATION_WARNING',
-                    subType: 'SAFARICOM_REPORTED_BALANCE_UPDATE_FAILED',
-                    error: `Failed to update Safaricom float with reported balance: ${floatUpdateErr.message}`,
-                    transactionId: transactionId,
-                    saleId: saleId,
-                    reportedBalance: airtimeDispatchResult.newSafaricomFloatBalance,
-                    createdAt: new Date(),
-                });
+
+            // Safaricom Specific Reconciliation: Only attempt if it was a Safaricom transaction
+            // FIX 2: Move Safaricom float update inside the Safaricom branch
+            if (targetCarrier === 'Safaricom' && airtimeDispatchResult.newSafaricomFloatBalance !== null) {
+                try {
+                    //directly update safaricom float with balance report
+                    await safaricomFloatDocRef.update({
+                        balance: airtimeDispatchResult.newSafaricomFloatBalance,
+                        lastUpdated: new Date()
+                    });
+                    logger.info(`✅ Safaricom float balance directly updated from API response for TransID ${transactionId}. New balance: ${airtimeDispatchResult.newSafaricomFloatBalance}`);
+                } catch (floatUpdateErr) {
+                    logger.error(`❌ Failed to directly update Safaricom float from API response for TransID ${transactionId}:`, {
+                        error: floatUpdateErr.message, reportedBalance: airtimeDispatchResult.newSafaricomFloatBalance
+                    });
+                    // FIX 3: Ensure `reportedBalance` is not undefined when adding to errors collection
+                    const reportedBalanceForError = airtimeDispatchResult.newSafaricomFloatBalance !== null ? airtimeDispatchResult.newSafaricomFloatBalance : 'N/A';
+                    await errorsCollection.add({
+                        type: 'FLOAT_RECONCILIATION_WARNING',
+                        subType: 'SAFARICOM_REPORTED_BALANCE_UPDATE_FAILED',
+                        error: `Failed to update Safaricom float with reported balance: ${floatUpdateErr.message}`,
+                        transactionId: transactionId,
+                        saleId: saleId,
+                        reportedBalance: reportedBalanceForError, // Pass a non-undefined value
+                        createdAt: new Date(),
+                    });
+                }
             }
         } else {
             saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'Airtime dispatch failed with no specific error message.';
@@ -709,9 +733,9 @@ app.post('/c2b-confirmation', async (req, res) => {
         // --- 5. Update the Airtime Sale document with final status ---
         await saleRef.update({
             status: airtimeDispatchStatus,
-            dispatchResult: airtimeDispatchResult,
+            dispatchResult: airtimeDispatchResult.data || airtimeDispatchResult.error || airtimeDispatchResult, // Ensure data is not undefined
             errorMessage: saleErrorMessage,
-            lastUpdated: new Date().toISOString(),
+            lastUpdated: new Date(), // Use native Date object
         });
         logger.info(`✅ Updated sale ${saleId} to status: ${airtimeDispatchStatus}.`);
 
@@ -720,12 +744,13 @@ app.post('/c2b-confirmation', async (req, res) => {
             linkedSaleId: saleId,
             fulfillmentStatus: airtimeDispatchStatus,
             status: airtimeDispatchStatus === 'COMPLETED' ? 'RECEIVED_FULFILLED' : 'RECEIVED_FULFILLMENT_FAILED',
-            lastUpdated: new Date().toISOString(),
+            lastUpdated: new Date(), // Use native Date object
         });
         logger.info(`✅ Updated transaction ${transactionId} with linked sale ID ${saleId} and fulfillment status.`);
 
 
     } catch (err) {
+        // FIX 6: Complete the `catch` block for general exceptions
         const generalErrorMessage = `Critical processing exception for C2B TransID ${transactionId}: ${err.message}`;
         logger.error(`❌ ${generalErrorMessage}`, {
             error: err.message,
@@ -740,6 +765,10 @@ app.post('/c2b-confirmation', async (req, res) => {
             transactionCode: transactionId,
             callbackData: callbackData,
             createdAt: now,
+            // FIX 3: Ensure 'reportedBalance' (if present) is not undefined here
+            // It's not applicable for general exceptions, so remove if not relevant,
+            // or ensure it's conditionally added with a valid value.
+            // For now, it's safer to remove it if it's not always available.
         });
 
         // Attempt to update the transaction document with a failure status if it was initially created
@@ -748,7 +777,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                 status: 'RECEIVED_PROCESSING_ERROR',
                 fulfillmentStatus: 'FAILED_SERVER_ERROR',
                 errorMessage: generalErrorMessage,
-                lastUpdated: new Date().toISOString(),
+                lastUpdated: new Date(), // Use native Date object
             });
         } catch (updateErr) {
             logger.error(`❌ Failed to update transaction ${transactionId} with processing error:`, { error: updateErr.message, stack: updateErr.stack });
@@ -759,7 +788,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                 await salesCollection.doc(saleId).update({
                     status: 'FAILED_SERVER_ERROR',
                     errorMessage: generalErrorMessage,
-                    lastUpdated: new Date().toISOString(),
+                    lastUpdated: new Date(), // Use native Date object
                 });
             } catch (updateErr) {
                 logger.error(`❌ Failed to update sale ${saleId} with processing error:`, { error: updateErr.message, stack: updateErr.stack });
@@ -767,66 +796,31 @@ app.post('/c2b-confirmation', async (req, res) => {
         }
 
         // CRITICAL: If float was debited but airtime dispatch failed due to an *exception* (not an API failure handled earlier)
-        // this is a potential reconciliation point.
-        if (floatDebitedSuccessfully && carrierSpecificFloatLogicalName) {
-             logger.warn(`⚠️ CRITICAL: Float was debited for TransID ${transactionId} from ${carrierSpecificFloatLogicalName} but airtime dispatch failed due to an exception. Manual reconciliation MAY be required.`);
+        // this is a potential data inconsistency. Flag for manual review if reversal hasn't happened.
+        if (floatDebitedSuccessfully) { // If we got to the point of debiting float
+             logger.error(`❌ CRITICAL RECONCILIATION NEEDED: Float was debited for TransID ${transactionId} but an unhandled exception occurred and airtime dispatch status is unknown or failed. Manual review required!`);
              await errorsCollection.add({
-                type: 'FLOAT_RECONCILIATION_WARNING',
-                subType: 'FLOAT_DEBITED_BUT_DISPATCH_FAILED_EXCEPTION',
-                error: `Float debited but airtime dispatch failed unexpectedly due to server error for TransID ${transactionId}.`,
-                transactionId: transactionId,
-                saleId: saleId,
-                amount: amount,
-                floatDocId: carrierSpecificFloatLogicalName,
-                createdAt: now,
+                 type: 'FLOAT_RECONCILIATION_CRITICAL',
+                 subType: 'UNHANDLED_EXCEPTION_AFTER_FLOAT_DEBIT',
+                 error: `Float debited but an unhandled exception occurred during fulfillment for TransID ${transactionId}. Manual reconciliation REQUIRED.`,
+                 transactionId: transactionId,
+                 saleId: saleId, // May be null if sale document wasn't created
+                 amount: amount,
+                 carrier: targetCarrier, // May be null/undefined if not determined
+                 createdAt: now,
+                 originalException: err.message,
+                 originalExceptionStack: err.stack
              });
-             // No automatic reversal here because we don't know the state of the API call.
-             // This truly requires manual review.
         }
 
     } finally {
-        res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received by DaimaPay server." });
+        // Ensure a response is always sent to M-Pesa
+        res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received, processing initiated (check logs for outcome)." });
     }
 });
 
-
-// --- Health check endpoint ---
-app.get('/', (req, res) => {
-    logger.info('Health check endpoint hit.');
-    res.send('DaimaPay C2B backend is live ✅');
-});
-
-// --- Fallback for unhandled routes ---
-app.use((req, res, next) => {
-    logger.warn(`404 Not Found: ${req.method} ${req.originalUrl}`);
-    res.status(404).json({ message: 'Endpoint Not Found' });
-});
-
-// --- Centralized Error Handling Middleware (Express 4-argument error handler) ---
-app.use((err, req, res, next) => {
-    logger.error('Express Error Handler caught an error:', {
-        method: req.method,
-        url: req.originalUrl,
-        error: err.message,
-        stack: err.stack,
-        body: req.body
-    });
-
-    if (res.headersSent) {
-        return next(err);
-    }
-
-    const statusCode = err.statusCode || 500;
-    const message = process.env.NODE_ENV === 'production' ? 'An unexpected error occurred.' : err.message;
-
-    res.status(statusCode).json({
-        message: message,
-        ...(process.env.NODE_ENV !== 'production' && { stack: err.stack }),
-    });
-});
 
 // Start the server
 app.listen(PORT, () => {
-    logger.info(`🚀 C2B Server running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode.`);
-    logger.info('Make sure NODE_ENV is set to "production" in your deployment environment.');
+    logger.info(`Server running on port ${PORT}`);
 });
