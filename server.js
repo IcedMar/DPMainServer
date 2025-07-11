@@ -3,7 +3,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const crypto = require('crypto');
-const { Firestore } = require('@google-cloud/firestore');
+const { Firestore, FieldValue } = require('@google-cloud/firestore'); // Import FieldValue
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -99,14 +99,15 @@ const errorsCollection = firestore.collection('errors');
 const safaricomFloatDocRef = firestore.collection('Saf_float').doc('current');
 const africasTalkingFloatDocRef = firestore.collection('AT_Float').doc('current');
 
+// NEW: Firestore reference for dealer config (updated path)
+const safaricomDealerConfigRef = firestore.collection('mpesa_settings').doc('main_config');
+
 // --- Africa's Talking Initialization ---
-// FIX 1: Import and initialize Africa's Talking
 const AfricasTalking = require('africastalking');
 const africastalking = AfricasTalking({
     apiKey: process.env.AT_API_KEY,
     username: process.env.AT_USERNAME
 });
-
 
 // --- Middleware ---
 app.use(helmet());
@@ -131,18 +132,63 @@ app.use('/c2b-validation', c2bLimiter);
 let cachedAirtimeToken = null;
 let tokenExpiryTimestamp = 0;
 
+// NEW: Cache variables for Dealer Service PIN
+let cachedDealerServicePin = null;
+let dealerPinExpiryTimestamp = 0;
+const DEALER_PIN_CACHE_TTL = 10 * 60 * 1000; // Cache for 10 minutes (600,000 milliseconds)
+
 //service pin
 async function generateServicePin(rawPin) {
-  // FIX 4: Use Buffer.from().toString('base64') instead of btoa for Node.js compatibility
-  console.log('[generateServicePin] subscriberNumber:', rawPin);
-  try {
-    const encodedPin = Buffer.from(rawPin).toString('base64');
-    console.log('[generateServicePin] encodedPin:', encodedPin);
-    return encodedPin;
-  } catch (error) {
-    console.error('[generateServicePin] error:', error);
-    throw new Error(`Service PIN generation failed: ${error.message}`);
-  }
+    console.log('[generateServicePin] subscriberNumber:', rawPin);
+    try {
+        const encodedPin = Buffer.from(rawPin).toString('base64'); // Correct for Node.js
+        console.log('[generateServicePin] encodedPin:', encodedPin);
+        return encodedPin;
+    } catch (error) {
+        console.error('[generateServicePin] error:', error);
+        throw new Error(`Service PIN generation failed: ${error.message}`);
+    }
+}
+
+// NEW: Function to get dealer service PIN from Firestore with caching
+async function getDealerServicePin() {
+    const now = Date.now();
+    if (cachedDealerServicePin && now < dealerPinExpiryTimestamp) {
+        logger.info('🔑 Using cached dealer service PIN from memory.');
+        return cachedDealerServicePin;
+    }
+
+    logger.info('🔄 Fetching dealer service PIN from Firestore (mpesa_settings/main_config/servicePin)...');
+    try {
+        const doc = await safaricomDealerConfigRef.get(); // This now points to mpesa_settings/main_config
+
+        if (!doc.exists) {
+            const errorMsg = 'Dealer service PIN configuration document (mpesa_settings/main_config) not found in Firestore. Please create it with a "servicePin" field.';
+            logger.error(`❌ ${errorMsg}`);
+            throw new Error(errorMsg);
+        }
+
+        const pin = doc.data().servicePin; // THIS IS THE KEY CHANGE for the field name
+
+        if (!pin) {
+            const errorMsg = 'Dealer service PIN field ("servicePin") not found in Firestore document (mpesa_settings/main_config). Please add it.';
+            logger.error(`❌ ${errorMsg}`);
+            throw new Error(errorMsg);
+        }
+
+        // Cache the retrieved PIN and set expiry
+        cachedDealerServicePin = pin;
+        dealerPinExpiryTimestamp = now + DEALER_PIN_CACHE_TTL;
+        logger.info('✅ Successfully fetched and cached dealer service PIN from Firestore.');
+        return pin;
+
+    } catch (error) {
+        logger.error('❌ Failed to retrieve dealer service PIN from Firestore:', {
+            message: error.message,
+            stack: error.stack
+        });
+        throw new Error(`Failed to retrieve dealer service PIN: ${error.message}`);
+    }
 }
 
 
@@ -249,12 +295,16 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
         const adjustedAmount = Math.round(amount * 100); // Amount in cents
 
         // Check if environment variables are set before making the call
-        if (!process.env.DEALER_SENDER_MSISDN || !process.env.DEALER_SERVICE_PIN || !process.env.MPESA_AIRTIME_URL) {
-            const missingEnvError = 'Missing Safaricom Dealer API environment variables (DEALER_SENDER_MSISDN, DEALER_SERVICE_PIN, MPESA_AIRTIME_URL).';
+        // REMOVED: process.env.DEALER_SERVICE_PIN from this check
+        if (!process.env.DEALER_SENDER_MSISDN || !process.env.MPESA_AIRTIME_URL) {
+            const missingEnvError = 'Missing Safaricom Dealer API environment variables (DEALER_SENDER_MSISDN, MPESA_AIRTIME_URL). DEALER_SERVICE_PIN is now fetched from Firestore.';
             logger.error(missingEnvError);
             return { status: 'FAILED', message: missingEnvError };
         }
-        const servicePin = await generateServicePin(process.env.DEALER_SERVICE_PIN);
+
+        // MODIFIED: Get PIN from Firestore/cache
+        const rawDealerPin = await getDealerServicePin(); // This will fetch from cache or Firestore
+        const servicePin = await generateServicePin(rawDealerPin); // Then encode it
 
         const body = {
             senderMsisdn: process.env.DEALER_SENDER_MSISDN,
@@ -315,80 +365,80 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
 
 // Function to send Africa's Talking Airtime
 async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
-  let normalizedPhone = phoneNumber;
+    let normalizedPhone = phoneNumber;
 
-  // AT expects E.164 format (+254XXXXXXXXX)
-  if (phoneNumber.startsWith('0')) {
-    normalizedPhone = '+254' + phoneNumber.slice(1);
-  } else if (phoneNumber.startsWith('254') && !phoneNumber.startsWith('+')) {
-    normalizedPhone = '+' + phoneNumber;
-  } else if (!phoneNumber.startsWith('+254')) {
-    logger.error('[sendAfricasTalkingAirtime] Invalid phone format:', { phoneNumber: phoneNumber });
-    return {
-      status: 'FAILED',
-      message: 'Invalid phone number format for Africa\'s Talking',
-      details: {
-        error: 'Phone must start with +254, 254, or 0'
-      }
-    };
-  }
-
-  if (!process.env.AT_API_KEY || !process.env.AT_USERNAME) {
-    logger.error('Missing Africa\'s Talking API environment variables.');
-    return { status: 'FAILED', message: 'Missing Africa\'s Talking credentials.' };
-  }
-
-  try {
-    const result = await africastalking.AIRTIME.send({
-      recipients: [{
-        phoneNumber: normalizedPhone,
-        amount: amount,
-        currencyCode: 'KES'
-      }]
-    });
-
-    // Defensive check
-    const response = result?.responses?.[0];
-    const status = response?.status;
-    const errorMessage = response?.errorMessage;
-
-    if (status === 'Sent' && errorMessage === 'None') {
-      logger.info(`✅ Africa's Talking airtime successfully sent to ${carrier}:`, {
-        recipient: normalizedPhone,
-        amount: amount,
-        at_response: result
-      });
-      return {
-        status: 'SUCCESS',
-        message: 'Africa\'s Talking airtime sent',
-        data: result,
-      };
-    } else {
-      logger.error(`❌ Africa's Talking airtime send indicates non-success for ${carrier}:`, {
-        recipient: normalizedPhone,
-        amount: amount,
-        at_response: result
-      });
-      return {
-        status: 'FAILED',
-        message: 'Africa\'s Talking airtime send failed or not successful.',
-        error: result,
-      };
+    // AT expects E.164 format (+254XXXXXXXXX)
+    if (phoneNumber.startsWith('0')) {
+        normalizedPhone = '+254' + phoneNumber.slice(1);
+    } else if (phoneNumber.startsWith('254') && !phoneNumber.startsWith('+')) {
+        normalizedPhone = '+' + phoneNumber;
+    } else if (!phoneNumber.startsWith('+254')) {
+        logger.error('[sendAfricasTalkingAirtime] Invalid phone format:', { phoneNumber: phoneNumber });
+        return {
+            status: 'FAILED',
+            message: 'Invalid phone number format for Africa\'s Talking',
+            details: {
+                error: 'Phone must start with +254, 254, or 0'
+            }
+        };
     }
 
-  } catch (error) {
-    logger.error(`❌ Africa's Talking airtime send failed for ${carrier} (exception caught):`, {
-      recipient: normalizedPhone,
-      amount: amount,
-      message: error.message,
-      stack: error.stack
-    });
-    return {
-      status: 'FAILED',
-      message: 'Africa\'s Talking airtime send failed (exception)',
-      error: error.message,
-    };
-  }
+    if (!process.env.AT_API_KEY || !process.env.AT_USERNAME) {
+        logger.error('Missing Africa\'s Talking API environment variables.');
+        return { status: 'FAILED', message: 'Missing Africa\'s Talking credentials.' };
+    }
+
+    try {
+        const result = await africastalking.AIRTIME.send({
+            recipients: [{
+                phoneNumber: normalizedPhone,
+                amount: amount,
+                currencyCode: 'KES'
+            }]
+        });
+
+        // Defensive check
+        const response = result?.responses?.[0];
+        const status = response?.status;
+        const errorMessage = response?.errorMessage;
+
+        if (status === 'Sent' && errorMessage === 'None') {
+            logger.info(`✅ Africa's Talking airtime successfully sent to ${carrier}:`, {
+                recipient: normalizedPhone,
+                amount: amount,
+                at_response: result
+            });
+            return {
+                status: 'SUCCESS',
+                message: 'Africa\'s Talking airtime sent',
+                data: result,
+            };
+        } else {
+            logger.error(`❌ Africa's Talking airtime send indicates non-success for ${carrier}:`, {
+                recipient: normalizedPhone,
+                amount: amount,
+                at_response: result
+            });
+            return {
+                status: 'FAILED',
+                message: 'Africa\'s Talking airtime send failed or not successful.',
+                error: result,
+            };
+        }
+
+    } catch (error) {
+        logger.error(`❌ Africa's Talking airtime send failed for ${carrier} (exception caught):`, {
+            recipient: normalizedPhone,
+            amount: amount,
+            message: error.message,
+            stack: error.stack
+        });
+        return {
+            status: 'FAILED',
+            message: 'Africa\'s Talking airtime send failed (exception)',
+            error: error.message,
+        };
+    }
 }
 
 /**
@@ -424,7 +474,7 @@ async function updateCarrierFloatBalance(carrierLogicalName, amount) {
         } else {
             // If the document doesn't exist, create it with initial balance 0
             logger.warn(`Float document '${carrierLogicalName}' not found. Initializing with balance 0.`);
-            t.set(floatDocRef, { balance: 0, lastUpdated: new Date() }); // FIX 5: Use native Date object
+            t.set(floatDocRef, { balance: 0, lastUpdated: new Date() }); // Use native Date object
             currentFloat = 0; // Set currentFloat to 0 for this transaction's calculation
         }
 
@@ -438,7 +488,7 @@ async function updateCarrierFloatBalance(carrierLogicalName, amount) {
             throw new Error('Insufficient carrier-specific float balance for this transaction.');
         }
 
-        t.update(floatDocRef, { balance: newFloat, lastUpdated: new Date() }); // FIX 5: Use native Date object
+        t.update(floatDocRef, { balance: newFloat, lastUpdated: new Date() }); // Use native Date object
         logger.info(`✅ Updated ${carrierLogicalName} float balance. Old: ${currentFloat}, New: ${newFloat}, Change: ${amount}`);
         return { success: true, newBalance: newFloat };
     });
@@ -447,7 +497,7 @@ async function updateCarrierFloatBalance(carrierLogicalName, amount) {
 
 // --- C2B (Offline Paybill) Callbacks ---
 
-// C2B Validation Endpoint (Optional but Recommended)
+// C2B Validation Endpoint
 app.post('/c2b-validation', async (req, res) => {
     const callbackData = req.body;
     const now = new Date();
@@ -457,7 +507,7 @@ app.post('/c2b-validation', async (req, res) => {
 
     const { TransAmount } = callbackData;
     const amount = parseFloat(TransAmount);
-    const MIN_AMOUNT = 5.00; // Minimum amount for airtime purchase
+    const MIN_AMOUNT = 5.00;
 
     // --- Validation Check: Amount KES 10 and above ---
     if (isNaN(amount) || amount < MIN_AMOUNT) {
@@ -470,8 +520,8 @@ app.post('/c2b-validation', async (req, res) => {
             createdAt: now,
         });
         return res.json({
-            "ResultCode": 1, // Reject
-            "ResultDesc": `Transaction amount must be KES ${MIN_AMOUNT} or more.`
+            "ResultCode": 1, // Changed from C2B00013 to 1 as per M-Pesa API spec for rejection
+            "ResultDesc": `Invalid Amount`
         });
     }
 
@@ -501,7 +551,7 @@ app.post('/c2b-confirmation', async (req, res) => {
         LastName,
     } = callbackData;
 
-    const topupNumber = BillRefNumber;
+    const topupNumber = BillRefNumber.replace(/\D/g, '');
     const amount = parseFloat(TransAmount);
     const mpesaNumber = MSISDN;
     const customerName = `${FirstName || ''} ${MiddleName || ''} ${LastName || ''}`.trim();
@@ -657,7 +707,6 @@ app.post('/c2b-confirmation', async (req, res) => {
             updateSaleFields.status = airtimeDispatchStatus;
 
             // Safaricom Specific Reconciliation: Only attempt if it was a Safaricom transaction
-            // FIX 2: Move Safaricom float update inside the Safaricom branch
             if (targetCarrier === 'Safaricom' && airtimeDispatchResult.newSafaricomFloatBalance !== null) {
                 try {
                     //directly update safaricom float with balance report
@@ -670,7 +719,6 @@ app.post('/c2b-confirmation', async (req, res) => {
                     logger.error(`❌ Failed to directly update Safaricom float from API response for TransID ${transactionId}:`, {
                         error: floatUpdateErr.message, reportedBalance: airtimeDispatchResult.newSafaricomFloatBalance
                     });
-                    // FIX 3: Ensure `reportedBalance` is not undefined when adding to errors collection
                     const reportedBalanceForError = airtimeDispatchResult.newSafaricomFloatBalance !== null ? airtimeDispatchResult.newSafaricomFloatBalance : 'N/A';
                     await errorsCollection.add({
                         type: 'FLOAT_RECONCILIATION_WARNING',
@@ -678,7 +726,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                         error: `Failed to update Safaricom float with reported balance: ${floatUpdateErr.message}`,
                         transactionId: transactionId,
                         saleId: saleId,
-                        reportedBalance: reportedBalanceForError, // Pass a non-undefined value
+                        reportedBalance: reportedBalanceForError,
                         createdAt: new Date(),
                     });
                 }
@@ -750,7 +798,6 @@ app.post('/c2b-confirmation', async (req, res) => {
 
 
     } catch (err) {
-        // FIX 6: Complete the `catch` block for general exceptions
         const generalErrorMessage = `Critical processing exception for C2B TransID ${transactionId}: ${err.message}`;
         logger.error(`❌ ${generalErrorMessage}`, {
             error: err.message,
@@ -765,10 +812,6 @@ app.post('/c2b-confirmation', async (req, res) => {
             transactionCode: transactionId,
             callbackData: callbackData,
             createdAt: now,
-            // FIX 3: Ensure 'reportedBalance' (if present) is not undefined here
-            // It's not applicable for general exceptions, so remove if not relevant,
-            // or ensure it's conditionally added with a valid value.
-            // For now, it's safer to remove it if it's not always available.
         });
 
         // Attempt to update the transaction document with a failure status if it was initially created
