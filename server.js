@@ -335,7 +335,7 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
         });
         logger.info(`✅ Africa's Talking airtime sent to ${carrier}:`, { recipient: normalizedPhone, amount: amount, at_response: result });
 
-        if (result && result.responses && result.responses.length > 0 && result.responses[0].status === 'Success') {
+        if (result && result.responses && result.responses.length > 0 && result.responses[0].status === 'Sent') {
             return {
                 status: 'SUCCESS',
                 message: 'Africa\'s Talking airtime sent',
