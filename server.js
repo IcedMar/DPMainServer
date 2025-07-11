@@ -3,7 +3,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const crypto = require('crypto');
-const { Firestore, FieldValue } = require('@google-cloud/firestore'); // Import FieldValue
+const { Firestore, FieldValue, AggregateField } = require('@google-cloud/firestore'); // Import FieldValue and AggregateField
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -112,6 +112,7 @@ const africastalking = AfricasTalking({
 // --- Middleware ---
 app.use(helmet());
 app.use(bodyParser.json({ limit: '1mb' }));
+app.use(cors()); // Enable CORS for all routes
 
 const c2bLimiter = rateLimit({
     windowMs: 5 * 60 * 1000,
@@ -139,13 +140,13 @@ const DEALER_PIN_CACHE_TTL = 10 * 60 * 1000; // Cache for 10 minutes (600,000 mi
 
 //service pin
 async function generateServicePin(rawPin) {
-    console.log('[generateServicePin] subscriberNumber:', rawPin);
+    logger.debug('[generateServicePin] rawPin length:', rawPin ? rawPin.length : 'null');
     try {
         const encodedPin = Buffer.from(rawPin).toString('base64'); // Correct for Node.js
-        console.log('[generateServicePin] encodedPin:', encodedPin);
+        logger.debug('[generateServicePin] encodedPin length:', encodedPin.length);
         return encodedPin;
     } catch (error) {
-        console.error('[generateServicePin] error:', error);
+        logger.error('[generateServicePin] error:', error);
         throw new Error(`Service PIN generation failed: ${error.message}`);
     }
 }
@@ -271,15 +272,9 @@ async function getCachedAirtimeToken() {
 
 function normalizeReceiverPhoneNumber(num) {
     let normalized = String(num).replace(/^(\+254|254)/, '0').trim();
-    // This function originally aimed for '07XXXXXXXX' but then '7XXXXXXXX' for Safaricom API.
-    // The Safaricom API expects the 9-digit format (e.g., 712345678).
-    // The Africa's Talking API expects +254XXXXXXXXX.
-    // Let's refine this function to normalize for Safaricom's specific needs,
-    // and Africa's Talking will handle its own normalization internally if needed.
     if (normalized.startsWith('0') && normalized.length === 10) {
         return normalized.slice(1); // Converts '0712345678' to '712345678'
     }
-    // If it's already 9 digits and doesn't start with 0, assume it's good for Safaricom.
     if (normalized.length === 9 && !normalized.startsWith('0')) {
         return normalized;
     }
@@ -294,15 +289,12 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
         const normalizedReceiver = normalizeReceiverPhoneNumber(receiverNumber);
         const adjustedAmount = Math.round(amount * 100); // Amount in cents
 
-        // Check if environment variables are set before making the call
-        // REMOVED: process.env.DEALER_SERVICE_PIN from this check
         if (!process.env.DEALER_SENDER_MSISDN || !process.env.MPESA_AIRTIME_URL) {
             const missingEnvError = 'Missing Safaricom Dealer API environment variables (DEALER_SENDER_MSISDN, MPESA_AIRTIME_URL). DEALER_SERVICE_PIN is now fetched from Firestore.';
             logger.error(missingEnvError);
             return { status: 'FAILED', message: missingEnvError };
         }
 
-        // MODIFIED: Get PIN from Firestore/cache
         const rawDealerPin = await getDealerServicePin(); // This will fetch from cache or Firestore
         const servicePin = await generateServicePin(rawDealerPin); // Then encode it
 
@@ -474,21 +466,18 @@ async function updateCarrierFloatBalance(carrierLogicalName, amount) {
         } else {
             // If the document doesn't exist, create it with initial balance 0
             logger.warn(`Float document '${carrierLogicalName}' not found. Initializing with balance 0.`);
-            t.set(floatDocRef, { balance: 0, lastUpdated: new Date() }); // Use native Date object
+            t.set(floatDocRef, { balance: 0, lastUpdated: FieldValue.serverTimestamp() }); // Use FieldValue.serverTimestamp()
             currentFloat = 0; // Set currentFloat to 0 for this transaction's calculation
         }
 
         const newFloat = currentFloat + amount; // amount can be negative for debit
-        // Allow negative float if the update is a CREDIT (amount > 0) AND the previous float was negative.
-        // This handles cases where we might manually add funds to a float that went negative.
-        // For debits (amount < 0), ensure it doesn't go below zero.
         if (amount < 0 && newFloat < 0) {
             const errorMessage = `Attempt to debit ${carrierLogicalName} float below zero. Current: ${currentFloat}, Attempted debit: ${-amount}`;
             logger.warn(`⚠️ ${errorMessage}`);
             throw new Error('Insufficient carrier-specific float balance for this transaction.');
         }
 
-        t.update(floatDocRef, { balance: newFloat, lastUpdated: new Date() }); // Use native Date object
+        t.update(floatDocRef, { balance: newFloat, lastUpdated: FieldValue.serverTimestamp() }); // Use FieldValue.serverTimestamp()
         logger.info(`✅ Updated ${carrierLogicalName} float balance. Old: ${currentFloat}, New: ${newFloat}, Change: ${amount}`);
         return { success: true, newBalance: newFloat };
     });
@@ -552,7 +541,7 @@ app.post('/c2b-confirmation', async (req, res) => {
     } = callbackData;
 
     const topupNumber = BillRefNumber.replace(/\D/g, '');
-    const amount = parseFloat(TransAmount);
+    const amount = parseFloat(TransAmount); // This is the original amount paid by customer
     const mpesaNumber = MSISDN;
     const customerName = `${FirstName || ''} ${MiddleName || ''} ${LastName || ''}`.trim();
 
@@ -571,14 +560,14 @@ app.post('/c2b-confirmation', async (req, res) => {
         await transactionsCollection.doc(transactionId).set({
             transactionID: transactionId,
             transactionTime: TransTime,
-            amountReceived: amount,
+            amountReceived: amount, // Original amount paid by customer
             payerMsisdn: mpesaNumber,
             payerName: customerName,
             billRefNumber: topupNumber,
             mpesaRawCallback: callbackData,
             status: 'RECEIVED_PENDING_SALE',
-            createdAt: now,
-            lastUpdated: now,
+            createdAt: FieldValue.serverTimestamp(), // Use server timestamp
+            lastUpdated: FieldValue.serverTimestamp(), // Use server timestamp
         });
         logger.info(`✅ Recorded incoming transaction ${transactionId} in 'transactions' collection.`);
 
@@ -593,13 +582,13 @@ app.post('/c2b-confirmation', async (req, res) => {
                 error: errorMessage,
                 transactionId: transactionId,
                 callbackData: callbackData,
-                createdAt: now,
+                createdAt: FieldValue.serverTimestamp(),
             });
             await transactionsCollection.doc(transactionId).update({
                 status: 'RECEIVED_FULFILLMENT_FAILED',
                 fulfillmentStatus: 'FAILED_UNKNOWN_CARRIER',
                 errorMessage: errorMessage,
-                lastUpdated: now,
+                lastUpdated: FieldValue.serverTimestamp(),
             });
             return res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received, but airtime not dispatched due to unsupported carrier." });
         }
@@ -625,21 +614,23 @@ app.post('/c2b-confirmation', async (req, res) => {
                     error: unmappedError,
                     transactionId: transactionId,
                     callbackData: callbackData,
-                    createdAt: now,
+                    createdAt: FieldValue.serverTimestamp(),
                 });
                 await transactionsCollection.doc(transactionId).update({
                     status: 'RECEIVED_FULFILLMENT_FAILED',
                     fulfillmentStatus: 'FAILED_NO_FLOAT_MAPPING',
                     errorMessage: unmappedError,
-                    lastUpdated: now,
+                    lastUpdated: FieldValue.serverTimestamp(),
                 });
                 return res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received, but airtime not dispatched due to internal mapping error." });
         }
 
         // --- 3. Debit Carrier-Specific Float Balance & Record Airtime Sale attempt ---
+        // The float is debited by the ORIGINAL amount received from the customer.
+        // The bonus amount is "extra" and comes from the float, but the customer only paid the original.
         let floatUpdateResult;
         try {
-            floatUpdateResult = await updateCarrierFloatBalance(carrierSpecificFloatLogicalName, -amount); // Debit
+            floatUpdateResult = await updateCarrierFloatBalance(carrierSpecificFloatLogicalName, -amount); // Debit original amount
             floatDebitedSuccessfully = true;
         } catch (error) {
             floatUpdateResult = { success: false, reason: 'FLOAT_DEBIT_FAILED', message: error.message };
@@ -654,17 +645,15 @@ app.post('/c2b-confirmation', async (req, res) => {
                 error: errorMessage,
                 transactionId: transactionId,
                 callbackData: callbackData,
-                createdAt: now,
+                createdAt: FieldValue.serverTimestamp(),
             });
 
             await transactionsCollection.doc(transactionId).update({
                 status: 'RECEIVED_FLOAT_ISSUE',
                 fulfillmentStatus: 'FAILED_INSUFFICIENT_FLOAT',
                 errorMessage: errorMessage,
-                lastUpdated: now,
+                lastUpdated: FieldValue.serverTimestamp(),
             });
-            // Importantly, return "ResultCode": 0 here, because you've received the money.
-            // The user will not get their airtime, but M-Pesa is done with its part.
             return res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received, but airtime not dispatched due to insufficient float." });
         }
 
@@ -676,28 +665,56 @@ app.post('/c2b-confirmation', async (req, res) => {
         let airtimeDispatchResult = null;
         let saleErrorMessage = null;
 
+        // --- FETCH BONUS SETTINGS AND CALCULATE FINAL AMOUNT TO DISPATCH ---
+        const bonusDocRef = firestore.collection('airtime_bonuses').doc('current_settings');
+        const bonusDocSnap = await bonusDocRef.get();
+        const bonusSettings = bonusDocSnap.exists ? bonusDocSnap.data() : { safaricomPercentage: 0, africastalkingPercentage: 0 };
+
+        let finalAmountToDispatch = amount; // Start with original amount
+        let bonusApplied = 0;
+
+        if (targetCarrier === 'Safaricom') {
+            if (bonusSettings.safaricomPercentage > 0) {
+                bonusApplied = amount * (bonusSettings.safaricomPercentage / 100);
+                finalAmountToDispatch = amount + bonusApplied;
+                logger.info(`Applying ${bonusSettings.safaricomPercentage}% Safaricom bonus. Original: ${amount}, Bonus: ${bonusApplied}, Final: ${finalAmountToDispatch}`);
+            }
+        } else { // Airtel, Telkom, Equitel, Faiba via Africa's Talking
+            if (bonusSettings.africastalkingPercentage > 0) {
+                bonusApplied = amount * (bonusSettings.africastalkingPercentage / 100);
+                finalAmountToDispatch = amount + bonusApplied;
+                logger.info(`Applying ${bonusSettings.africastalkingPercentage}% AfricasTalking bonus. Original: ${amount}, Bonus: ${bonusApplied}, Final: ${finalAmountToDispatch}`);
+            }
+        }
+        // Round to 2 decimal places for financial accuracy
+        finalAmountToDispatch = parseFloat(finalAmountToDispatch.toFixed(2));
+        bonusApplied = parseFloat(bonusApplied.toFixed(2));
+
+
         await saleRef.set({
             saleId: saleId,
             relatedTransactionId: transactionId,
             topupNumber: topupNumber,
-            amount: amount,
+            originalAmountPaid: amount, // Store the original amount paid by customer
+            amount: finalAmountToDispatch, // This is the amount actually dispatched (original + bonus)
+            bonusApplied: bonusApplied, // Store the bonus amount
             carrier: targetCarrier, // Use the detected carrier
             status: 'PENDING_DISPATCH',
-            dispatchAttemptedAt: now,
-            createdAt: now,
-            lastUpdated: now,
+            dispatchAttemptedAt: FieldValue.serverTimestamp(), // Use server timestamp
+            createdAt: FieldValue.serverTimestamp(), // Use server timestamp
+            lastUpdated: FieldValue.serverTimestamp(), // Use server timestamp
         });
-        logger.info(`✅ Initialized sale document ${saleId} in 'sales' collection for TransID ${transactionId}.`);
+        logger.info(`✅ Initialized sale document ${saleId} in 'sales' collection for TransID ${transactionId} with bonus details.`);
 
-        // --- 4. Attempt to dispatch airtime ---
+        // --- 4. Attempt to dispatch airtime with the final calculated amount ---
         if (targetCarrier === 'Safaricom') {
-            airtimeDispatchResult = await sendSafaricomAirtime(topupNumber, amount);
+            airtimeDispatchResult = await sendSafaricomAirtime(topupNumber, finalAmountToDispatch);
         } else { // Airtel, Telkom, Equitel, Faiba via Africa's Talking
-            airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, amount, targetCarrier);
+            airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
         }
 
         const updateSaleFields = {
-            lastUpdated: new Date(), // Use native Date object for Timestamp
+            lastUpdated: FieldValue.serverTimestamp(), // Use server timestamp
             dispatchResult: airtimeDispatchResult.data || airtimeDispatchResult.error || airtimeDispatchResult, // Store raw API response/error
         };
 
@@ -712,7 +729,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                     //directly update safaricom float with balance report
                     await safaricomFloatDocRef.update({
                         balance: airtimeDispatchResult.newSafaricomFloatBalance,
-                        lastUpdated: new Date()
+                        lastUpdated: FieldValue.serverTimestamp()
                     });
                     logger.info(`✅ Safaricom float balance directly updated from API response for TransID ${transactionId}. New balance: ${airtimeDispatchResult.newSafaricomFloatBalance}`);
                 } catch (floatUpdateErr) {
@@ -727,7 +744,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                         transactionId: transactionId,
                         saleId: saleId,
                         reportedBalance: reportedBalanceForError,
-                        createdAt: new Date(),
+                        createdAt: FieldValue.serverTimestamp(),
                     });
                 }
             }
@@ -737,133 +754,167 @@ app.post('/c2b-confirmation', async (req, res) => {
                 error_message: saleErrorMessage,
                 carrier: targetCarrier,
                 topupNumber: topupNumber,
-                amount: amount,
+                originalAmountPaid: amount,
+                finalAmountDispatched: finalAmountToDispatch,
                 airtimeResponse: airtimeDispatchResult,
                 callbackData: callbackData,
             });
             await errorsCollection.add({
                 type: 'AIRTIME_SALE_ERROR',
-                subType: `AIRTIME_API_FAIL_${targetCarrier.toUpperCase()}`,
+                subType: 'AIRTIME_DISPATCH_FAILED',
                 error: saleErrorMessage,
                 transactionId: transactionId,
                 saleId: saleId,
-                originalAmount: amount,
-                airtimeResponse: airtimeDispatchResult,
                 callbackData: callbackData,
-                createdAt: now,
+                airtimeApiResponse: airtimeDispatchResult,
+                createdAt: FieldValue.serverTimestamp(),
             });
-            airtimeDispatchStatus = 'FAILED_DISPATCH_API';
-
-            // REVERSAL LOGIC: If airtime dispatch failed *after* carrier-specific float was debited,
-            // we need to reverse the float or flag for manual review.
-            logger.warn(`⚠️ Airtime dispatch failed after float debit. Attempting to reverse float for TransID ${transactionId}, Sale ${saleId}.`);
-            try {
-                // Re-credit the specific carrier's float
-                await updateCarrierFloatBalance(carrierSpecificFloatLogicalName, amount); // Credit back
-                logger.info(`✅ Successfully reversed float debit for TransID ${transactionId}, Sale ${saleId}.`);
-            } catch (reverseError) {
-                logger.error(`❌ CRITICAL: Failed to reverse float debit for TransID ${transactionId}, Sale ${saleId}:`, {
-                    error: reverseError.message,
-                    stack: reverseError.stack
-                });
-                await errorsCollection.add({
-                    type: 'FLOAT_RECONCILIATION_WARNING',
-                    subType: 'FLOAT_REVERSAL_FAILED',
-                    error: `Float debited but dispatch failed, and reversal failed for TransID ${transactionId}. Manual reconciliation REQUIRED.`,
-                    transactionId: transactionId,
-                    saleId: saleId,
-                    amount: amount,
-                    createdAt: now,
-                });
-            }
+            updateSaleFields.status = 'FAILED_DISPATCH_API'; // Specific status for API failure
+            updateSaleFields.errorMessage = saleErrorMessage;
         }
 
-        // --- 5. Update the Airtime Sale document with final status ---
-        await saleRef.update({
-            status: airtimeDispatchStatus,
-            dispatchResult: airtimeDispatchResult.data || airtimeDispatchResult.error || airtimeDispatchResult, // Ensure data is not undefined
-            errorMessage: saleErrorMessage,
-            lastUpdated: new Date(), // Use native Date object
-        });
-        logger.info(`✅ Updated sale ${saleId} to status: ${airtimeDispatchStatus}.`);
+        await saleRef.update(updateSaleFields);
+        logger.info(`✅ Updated sale document ${saleId} with dispatch result.`);
 
-        // --- 6. Update the 'transactions' document with fulfillment status ---
+        // --- 5. Update main transaction status based on airtime dispatch ---
         await transactionsCollection.doc(transactionId).update({
-            linkedSaleId: saleId,
+            status: airtimeDispatchStatus === 'COMPLETED' ? 'COMPLETED_AND_FULFILLED' : 'RECEIVED_FULFILLMENT_FAILED',
             fulfillmentStatus: airtimeDispatchStatus,
-            status: airtimeDispatchStatus === 'COMPLETED' ? 'RECEIVED_FULFILLED' : 'RECEIVED_FULFILLMENT_FAILED',
-            lastUpdated: new Date(), // Use native Date object
+            fulfillmentDetails: airtimeDispatchResult,
+            lastUpdated: FieldValue.serverTimestamp(),
         });
-        logger.info(`✅ Updated transaction ${transactionId} with linked sale ID ${saleId} and fulfillment status.`);
 
+        logger.info(`Final status for TransID ${transactionId}: ${airtimeDispatchStatus}`);
+        res.json({ "ResultCode": 0, "ResultDesc": "C2B Confirmation and Airtime Dispatch Processed." });
 
-    } catch (err) {
-        const generalErrorMessage = `Critical processing exception for C2B TransID ${transactionId}: ${err.message}`;
-        logger.error(`❌ ${generalErrorMessage}`, {
-            error: err.message,
-            stack: err.stack,
-            TransID: transactionId,
-            callbackData: callbackData
-        });
-        await errorsCollection.add({
-            type: 'C2B_PROCESSING_EXCEPTION',
-            error: generalErrorMessage,
-            stack: err.stack,
-            transactionCode: transactionId,
+    } catch (error) {
+        logger.error(`❌ CRITICAL ERROR in C2B Confirmation for TransID ${transactionId}:`, {
+            message: error.message,
+            stack: error.stack,
             callbackData: callbackData,
-            createdAt: now,
+            floatDebitedSuccessfully: floatDebitedSuccessfully, // Important for debugging
+            carrierSpecificFloatLogicalName: carrierSpecificFloatLogicalName, // Important for debugging
         });
 
-        // Attempt to update the transaction document with a failure status if it was initially created
-        try {
-            await transactionsCollection.doc(transactionId).update({
-                status: 'RECEIVED_PROCESSING_ERROR',
-                fulfillmentStatus: 'FAILED_SERVER_ERROR',
-                errorMessage: generalErrorMessage,
-                lastUpdated: new Date(), // Use native Date object
-            });
-        } catch (updateErr) {
-            logger.error(`❌ Failed to update transaction ${transactionId} with processing error:`, { error: updateErr.message, stack: updateErr.stack });
-        }
-        // Also try to update the sale document if it was created (and float was debited)
-        if (saleId) {
+        // Attempt to update the transaction status to reflect the critical error
+        if (transactionId) {
             try {
-                await salesCollection.doc(saleId).update({
-                    status: 'FAILED_SERVER_ERROR',
-                    errorMessage: generalErrorMessage,
-                    lastUpdated: new Date(), // Use native Date object
+                await transactionsCollection.doc(transactionId).update({
+                    status: 'CRITICAL_PROCESSING_ERROR',
+                    errorMessage: `Critical server error during C2B processing: ${error.message}`,
+                    lastUpdated: FieldValue.serverTimestamp(),
                 });
-            } catch (updateErr) {
-                logger.error(`❌ Failed to update sale ${saleId} with processing error:`, { error: updateErr.message, stack: updateErr.stack });
+            } catch (updateError) {
+                logger.error(`❌ Failed to update transaction ${transactionId} after critical error:`, updateError.message);
             }
         }
 
-        // CRITICAL: If float was debited but airtime dispatch failed due to an *exception* (not an API failure handled earlier)
-        // this is a potential data inconsistency. Flag for manual review if reversal hasn't happened.
-        if (floatDebitedSuccessfully) { // If we got to the point of debiting float
-             logger.error(`❌ CRITICAL RECONCILIATION NEEDED: Float was debited for TransID ${transactionId} but an unhandled exception occurred and airtime dispatch status is unknown or failed. Manual review required!`);
-             await errorsCollection.add({
-                 type: 'FLOAT_RECONCILIATION_CRITICAL',
-                 subType: 'UNHANDLED_EXCEPTION_AFTER_FLOAT_DEBIT',
-                 error: `Float debited but an unhandled exception occurred during fulfillment for TransID ${transactionId}. Manual reconciliation REQUIRED.`,
-                 transactionId: transactionId,
-                 saleId: saleId, // May be null if sale document wasn't created
-                 amount: amount,
-                 carrier: targetCarrier, // May be null/undefined if not determined
-                 createdAt: now,
-                 originalException: err.message,
-                 originalExceptionStack: err.stack
-             });
-        }
-
-    } finally {
-        // Ensure a response is always sent to M-Pesa
-        res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received, processing initiated (check logs for outcome)." });
+        res.json({ "ResultCode": 0, "ResultDesc": "Internal server error during processing." });
     }
 });
 
+// --- NEW AIRTIME BONUS API ENDPOINTS ---
+const CURRENT_BONUS_DOC_PATH = 'airtime_bonuses/current_settings'; // Document path for current settings
+const BONUS_HISTORY_COLLECTION = 'bonus_history'; // Collection for history logs
 
-// Start the server
-app.listen(PORT, () => {
-    logger.info(`Server running on port ${PORT}`);
+// GET current bonus percentages
+app.get('/api/airtime-bonuses/current', async (req, res) => {
+    try {
+        const docRef = firestore.collection('airtime_bonuses').doc('current_settings');
+        const docSnap = await docRef.get();
+
+        if (docSnap.exists) {
+            res.json(docSnap.data());
+        } else {
+            // If document doesn't exist, initialize it with default values
+            logger.info('Initializing airtime_bonuses/current_settings with default values.');
+            await docRef.set({ safaricomPercentage: 0, africastalkingPercentage: 0, lastUpdated: FieldValue.serverTimestamp() });
+            res.json({ safaricomPercentage: 0, africastalkingPercentage: 0 });
+        }
+    } catch (error) {
+        logger.error('Error fetching current airtime bonuses:', { message: error.message, stack: error.stack });
+        res.status(500).json({ error: 'Failed to fetch current airtime bonuses.' });
+    }
 });
+
+// POST to update bonus percentages and log history
+app.post('/api/airtime-bonuses/update', async (req, res) => {
+    const { safaricomPercentage, africastalkingPercentage, actor } = req.body; // 'actor' could be the authenticated user's ID/email
+
+    if (typeof safaricomPercentage !== 'number' || typeof africastalkingPercentage !== 'number' || safaricomPercentage < 0 || africastalkingPercentage < 0) {
+        logger.warn('Invalid bonus percentages received for update.', { safaricomPercentage, africastalkingPercentage });
+        return res.status(400).json({ error: 'Invalid bonus percentages. Must be non-negative numbers.' });
+    }
+
+    try {
+        const currentSettingsDocRef = firestore.collection('airtime_bonuses').doc('current_settings');
+        const currentSettingsSnap = await currentSettingsDocRef.get();
+        const oldSettings = currentSettingsSnap.exists ? currentSettingsSnap.data() : { safaricomPercentage: 0, africastalkingPercentage: 0 };
+
+        const batch = firestore.batch();
+
+        // Update the current settings document
+        batch.set(currentSettingsDocRef, {
+            safaricomPercentage: safaricomPercentage,
+            africastalkingPercentage: africastalkingPercentage,
+            lastUpdated: FieldValue.serverTimestamp(), // Use server timestamp
+        }, { merge: true }); // Use merge to avoid overwriting other fields if they exist
+
+        // Add history entries only if values have changed
+        if (safaricomPercentage !== oldSettings.safaricomPercentage) {
+            batch.set(firestore.collection(BONUS_HISTORY_COLLECTION).doc(), {
+                company: 'Safaricom',
+                oldPercentage: oldSettings.safaricomPercentage || 0,
+                newPercentage: safaricomPercentage,
+                timestamp: FieldValue.serverTimestamp(),
+                actor: actor || 'system', // Default to 'system' if actor is not provided
+            });
+            logger.info(`Safaricom bonus changed from ${oldSettings.safaricomPercentage} to ${safaricomPercentage} by ${actor || 'system'}.`);
+        }
+        if (africastalkingPercentage !== oldSettings.africastalkingPercentage) {
+            batch.set(firestore.collection(BONUS_HISTORY_COLLECTION).doc(), {
+                company: 'Africastalking',
+                oldPercentage: oldSettings.africastalkingPercentage || 0,
+                newPercentage: africastalkingPercentage,
+                timestamp: FieldValue.serverTimestamp(),
+                actor: actor || 'system', // Default to 'system' if actor is not provided
+            });
+            logger.info(`AfricasTalking bonus changed from ${oldSettings.africastalkingPercentage} to ${africastalkingPercentage} by ${actor || 'system'}.`);
+        }
+
+        await batch.commit();
+        res.json({ success: true, message: 'Bonus percentages updated successfully.' });
+
+    } catch (error) {
+        logger.error('Error updating airtime bonuses:', { message: error.message, stack: error.stack });
+        res.status(500).json({ error: 'Failed to update airtime bonuses.' });
+    }
+});
+
+// GET bonus history
+app.get('/api/airtime-bonuses/history', async (req, res) => {
+    try {
+        const historyQuery = firestore.collection(BONUS_HISTORY_COLLECTION)
+                               .orderBy('timestamp', 'desc')
+                               .limit(50); // Limit to last 50 entries for performance
+
+        const snapshot = await historyQuery.get();
+        const history = snapshot.docs.map(doc => {
+            const data = doc.data();
+            return {
+                id: doc.id,
+                company: data.company,
+                oldPercentage: data.oldPercentage,
+                newPercentage: data.newPercentage,
+                timestamp: data.timestamp ? data.timestamp.toDate().toISOString() : null, // Convert Timestamp to ISO string for frontend
+                actor: data.actor,
+            };
+        });
+        res.json(history);
+    } catch (error) {
+        logger.error('Error fetching airtime bonus history:', { message: error.message, stack: error.stack });
+        res.status(500).json({ error: 'Failed to fetch airtime bonus history.' });
+    }
+});
+
+app.listen(PORT, () => logger.info(`✅ Server running on port ${PORT}`));
