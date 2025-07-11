@@ -298,74 +298,80 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
 
 
 // Function to send Africa's Talking Airtime
-const africastalking = require('africastalking')({
-    apiKey: process.env.AT_API_KEY,
-    username: process.env.AT_USERNAME,
-});
-
 async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
   let normalizedPhone = phoneNumber;
-    if (phoneNumber.startsWith('0')) {
-        normalizedPhone = '+254' + phoneNumber.slice(1);
-    } else if (phoneNumber.startsWith('254')) {
-        normalizedPhone = '+' + phoneNumber;
-    } else if (!phoneNumber.startsWith('+254')) {
-        console.error('[sendAfricasTalkingAirtime] Invalid phone format:', phoneNumber);
-        return {
-            status: 'FAILED',
-            message: 'Invalid phone number format for Africa\'s Talking',
-            transaction_id: transactionId,
-            details: {
-            error: 'Phone must start with +254, 254, or 0'
-            }
-        };
-    }
-    try {
-        if (!process.env.AT_API_KEY || !process.env.AT_USERNAME) {
-            logger.error('Missing Africa\'s Talking API environment variables.');
-            return { status: 'FAILED', message: 'Missing Africa\'s Talking credentials.' };
-        }
-        const result = await africastalking.AIRTIME.send({
-            recipients: [
-                { 
-                phoneNumber: normalizedPhone, 
-                amount: amount,
-                currencyCode: 'KES' 
-            }],
-        });
-        logger.info(`✅ Africa's Talking airtime sent to ${carrier}:`, { recipient: normalizedPhone, amount: amount, at_response: result });
 
-        if (result && result.responses && result.responses.length > 0 && result.responses[0].status === 'Sent') {
-            return {
-                status: 'SUCCESS',
-                message: 'Africa\'s Talking airtime sent',
-                data: result,
-            };
-        } else {
-            logger.error(`❌ Africa's Talking airtime send indicates non-success status for ${carrier}:`, {
-                recipient: phoneNumber,
-                amount: amount,
-                at_response: result
-            });
-            return {
-                status: 'FAILED',
-                message: 'Africa\'s Talking airtime send failed or not successful.',
-                error: result,
-            };
-        }
-    } catch (error) {
-        logger.error(`❌ Africa's Talking airtime send failed for ${carrier} (exception caught):`, {
-            recipient: phoneNumber,
-            amount: amount,
-            message: error.message,
-            stack: error.stack
-        });
-        return {
-            status: 'FAILED',
-            message: 'Africa\'s Talking airtime send failed (exception)',
-            error: error.message,
-        };
+  if (phoneNumber.startsWith('0')) {
+    normalizedPhone = '+254' + phoneNumber.slice(1);
+  } else if (phoneNumber.startsWith('254')) {
+    normalizedPhone = '+' + phoneNumber;
+  } else if (!phoneNumber.startsWith('+254')) {
+    console.error('[sendAfricasTalkingAirtime] Invalid phone format:', phoneNumber);
+    return {
+      status: 'FAILED',
+      message: 'Invalid phone number format for Africa\'s Talking',
+      details: {
+        error: 'Phone must start with +254, 254, or 0'
+      }
+    };
+  }
+
+  if (!process.env.AT_API_KEY || !process.env.AT_USERNAME) {
+    logger.error('Missing Africa\'s Talking API environment variables.');
+    return { status: 'FAILED', message: 'Missing Africa\'s Talking credentials.' };
+  }
+
+  try {
+    const result = await africastalking.AIRTIME.send({
+      recipients: [{
+        phoneNumber: normalizedPhone,
+        amount: amount,
+        currencyCode: 'KES'
+      }]
+    });
+
+    // Defensive check
+    const response = result?.responses?.[0];
+    const status = response?.status;
+    const errorMessage = response?.errorMessage;
+
+    if (status === 'Sent' && errorMessage === 'None') {
+      logger.info(`✅ Africa's Talking airtime successfully sent to ${carrier}:`, {
+        recipient: normalizedPhone,
+        amount: amount,
+        at_response: result
+      });
+      return {
+        status: 'SUCCESS',
+        message: 'Africa\'s Talking airtime sent',
+        data: result,
+      };
+    } else {
+      logger.error(`❌ Africa's Talking airtime send indicates non-success for ${carrier}:`, {
+        recipient: normalizedPhone,
+        amount: amount,
+        at_response: result
+      });
+      return {
+        status: 'FAILED',
+        message: 'Africa\'s Talking airtime send failed or not successful.',
+        error: result,
+      };
     }
+
+  } catch (error) {
+    logger.error(`❌ Africa's Talking airtime send failed for ${carrier} (exception caught):`, {
+      recipient: normalizedPhone,
+      amount: amount,
+      message: error.message,
+      stack: error.stack
+    });
+    return {
+      status: 'FAILED',
+      message: 'Africa\'s Talking airtime send failed (exception)',
+      error: error.message,
+    };
+  }
 }
 
 /**
