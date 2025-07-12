@@ -600,6 +600,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                 break;
             case 'Airtel':
             case 'Telkom':
+            case 'AirtelMoney': // Ensure you map all your AT supported carriers here
             case 'Equitel':
             case 'Faiba':
                 carrierSpecificFloatLogicalName = 'africasTalkingFloat'; // This maps to africasTalkingFloatDocRef
@@ -664,6 +665,7 @@ app.post('/c2b-confirmation', async (req, res) => {
         let airtimeDispatchStatus = 'FAILED';
         let airtimeDispatchResult = null;
         let saleErrorMessage = null;
+        let airtimeProviderUsed = null; // To track which provider successfully sent or was attempted
 
         // --- FETCH BONUS SETTINGS AND CALCULATE FINAL AMOUNT TO DISPATCH ---
         const bonusDocRef = firestore.collection('airtime_bonuses').doc('current_settings');
@@ -706,27 +708,82 @@ app.post('/c2b-confirmation', async (req, res) => {
         });
         logger.info(`✅ Initialized sale document ${saleId} in 'sales' collection for TransID ${transactionId} with bonus details.`);
 
-        // --- 4. Attempt to dispatch airtime with the final calculated amount ---
-        if (targetCarrier === 'Safaricom') {
-            airtimeDispatchResult = await sendSafaricomAirtime(topupNumber, finalAmountToDispatch);
-        } else { // Airtel, Telkom, Equitel, Faiba via Africa's Talking
-            airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
-        }
+        // --- Safaricom Primary Attempt ---
+        logger.info(`Attempting Safaricom airtime via Primary (Dealer Portal) for TransID: ${transactionId}`);
+        airtimeProviderUsed = 'SafaricomDealer';
+        airtimeDispatchResult = await sendSafaricomAirtime(topupNumber, finalAmountToDispatch);
+
+        if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
+            airtimeDispatchStatus = 'COMPLETED';
+            logger.info(`✅ Safaricom airtime successfully sent via Dealer Portal for sale ${saleId}.`);
+        } else {
+        logger.warn(`⚠️ Safaricom Dealer Portal failed for TransID ${transactionId}. Attempting fallback to Africastalking. Error: ${airtimeDispatchResult?.error || 'Unknown error'}`);
+
+        // === NEW: Refund Safaricom float ===
+        try {
+            await updateCarrierFloatBalance('safaricomFloat', amount); // Refund the Safaricom float
+            logger.info(`✅ Refunded Safaricom float for TransID ${transactionId}: +${amount}`);
+        } catch (refundError) {
+        logger.error(`❌ Failed to refund Safaricom float for TransID ${transactionId}: ${refundError.message}`);
+        await errorsCollection.add({
+            type: 'FLOAT_REFUND_ERROR',
+            subType: 'SAFARICOM_FALLBACK_REFUND_FAILED',
+            error: refundError.message,
+            transactionId: transactionId,
+            createdAt: FieldValue.serverTimestamp(),
+        });
+    }
+
+    // === NEW: Debit Africastalking float ===
+    let fallbackFloatDebitResult = { success: false };
+    try {
+        fallbackFloatDebitResult = await updateCarrierFloatBalance('africasTalkingFloat', -amount); // Debit Africastalking float
+        logger.info(`✅ Debited Africastalking float for fallback: -${amount} (TransID ${transactionId})`);
+    } catch (fallbackDebitError) {
+    logger.error(`❌ Failed to debit Africastalking float for fallback (TransID ${transactionId}): ${fallbackDebitError.message}`);
+    saleErrorMessage = `Fallback float debit failed: ${fallbackDebitError.message}`;
+    await errorsCollection.add({
+      type: 'FLOAT_DEBIT_ERROR',
+      subType: 'AFRICASTALKING_FALLBACK_DEBIT_FAILED',
+      error: fallbackDebitError.message,
+      transactionId: transactionId,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+  }
+
+  if (!fallbackFloatDebitResult.success) {
+    airtimeDispatchStatus = 'FAILED';
+    saleErrorMessage = saleErrorMessage || `Fallback float debit failed unexpectedly for TransID ${transactionId}.`;
+  } else {
+    // === NEW: Attempt fallback dispatch ===
+    airtimeProviderUsed = 'AfricasTalkingFallback';
+    airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
+
+    if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
+      airtimeDispatchStatus = 'COMPLETED';
+      logger.info(`✅ Safaricom fallback airtime successfully sent via Africastalking for sale ${saleId}.`);
+    } else {
+      saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'Africastalking fallback failed with no specific error.';
+      logger.error(`❌ Safaricom fallback via Africastalking failed for sale ${saleId}: ${saleErrorMessage}`);
+    }
+  }
+}
+
 
         const updateSaleFields = {
             lastUpdated: FieldValue.serverTimestamp(), // Use server timestamp
             dispatchResult: airtimeDispatchResult.data || airtimeDispatchResult.error || airtimeDispatchResult, // Store raw API response/error
+            airtimeProviderUsed: airtimeProviderUsed, // New field to track provider used
         };
 
-        if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
-            airtimeDispatchStatus = 'COMPLETED';
-            logger.info(`✅ Airtime successfully sent for sale ${saleId} (TransID ${transactionId}).`, { airtimeResponse: airtimeDispatchResult.data });
+        if (airtimeDispatchStatus === 'COMPLETED') { // Check the consolidated status
             updateSaleFields.status = airtimeDispatchStatus;
 
-            // Safaricom Specific Reconciliation: Only attempt if it was a Safaricom transaction
-            if (targetCarrier === 'Safaricom' && airtimeDispatchResult.newSafaricomFloatBalance !== null) {
+            // Safaricom Specific Reconciliation: Only attempt if Safaricom was the target carrier
+            // and the primary Safaricom Dealer Portal was used and reported a new balance.
+            // If AT was used as fallback, this part won't apply.
+            if (targetCarrier === 'Safaricom' && airtimeDispatchResult.newSafaricomFloatBalance !== null && airtimeProviderUsed === 'SafaricomDealer') {
                 try {
-                    //directly update safaricom float with balance report
                     await safaricomFloatDocRef.update({
                         balance: airtimeDispatchResult.newSafaricomFloatBalance,
                         lastUpdated: FieldValue.serverTimestamp()
@@ -748,8 +805,15 @@ app.post('/c2b-confirmation', async (req, res) => {
                     });
                 }
             }
+            // For Africas Talking (both primary for Airtel/Telkom and fallback for Safaricom),
+            // your `updateCarrierFloatBalance` already debits the float based on the sale.
+            // No need for a separate `africasTalkingFloatDocRef.update` here unless AT provides a balance in its API response
+            // that you specifically want to use for reconciliation, similar to Safaricom's.
+            // Currently, your `sendAfricasTalkingAirtime` doesn't extract a `newAfricasTalkingFloatBalance`.
+
         } else {
-            saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'Airtime dispatch failed with no specific error message.';
+            // Airtime dispatch ultimately failed (either primary or fallback)
+            saleErrorMessage = saleErrorMessage || 'Airtime dispatch failed with no specific error message.'; // Ensure it's not null
             logger.error(`❌ Airtime dispatch failed for sale ${saleId} (TransID ${transactionId}):`, {
                 error_message: saleErrorMessage,
                 carrier: targetCarrier,
@@ -761,15 +825,16 @@ app.post('/c2b-confirmation', async (req, res) => {
             });
             await errorsCollection.add({
                 type: 'AIRTIME_SALE_ERROR',
-                subType: 'AIRTIME_DISPATCH_FAILED',
+                subType: 'AIRTIME_DISPATCH_FAILED', // This subType remains generic for ultimate failure
                 error: saleErrorMessage,
                 transactionId: transactionId,
                 saleId: saleId,
                 callbackData: callbackData,
                 airtimeApiResponse: airtimeDispatchResult,
+                providerAttempted: airtimeProviderUsed, // Log which provider was ultimately responsible for failure
                 createdAt: FieldValue.serverTimestamp(),
             });
-            updateSaleFields.status = 'FAILED_DISPATCH_API'; // Specific status for API failure
+            updateSaleFields.status = 'FAILED_DISPATCH_API';
             updateSaleFields.errorMessage = saleErrorMessage;
         }
 
@@ -782,6 +847,7 @@ app.post('/c2b-confirmation', async (req, res) => {
             fulfillmentStatus: airtimeDispatchStatus,
             fulfillmentDetails: airtimeDispatchResult,
             lastUpdated: FieldValue.serverTimestamp(),
+            airtimeProviderUsed: airtimeProviderUsed, // Update transaction with provider used
         });
 
         logger.info(`Final status for TransID ${transactionId}: ${airtimeDispatchStatus}`);
@@ -895,8 +961,8 @@ app.post('/api/airtime-bonuses/update', async (req, res) => {
 app.get('/api/airtime-bonuses/history', async (req, res) => {
     try {
         const historyQuery = firestore.collection(BONUS_HISTORY_COLLECTION)
-                               .orderBy('timestamp', 'desc')
-                               .limit(50); // Limit to last 50 entries for performance
+                                       .orderBy('timestamp', 'desc')
+                                       .limit(50); // Limit to last 50 entries for performance
 
         const snapshot = await historyQuery.get();
         const history = snapshot.docs.map(doc => {
