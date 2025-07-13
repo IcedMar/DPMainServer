@@ -98,6 +98,9 @@ const salesCollection = firestore.collection('sales');
 const errorsCollection = firestore.collection('errors');
 const safaricomFloatDocRef = firestore.collection('Saf_float').doc('current');
 const africasTalkingFloatDocRef = firestore.collection('AT_Float').doc('current');
+const reconciledTransactionsCollection = firestore.collection('reconciled_transactions');
+const failedReconciliationsCollection = firestore.collection('failed_reconciliations');
+
 
 // NEW: Firestore reference for dealer config (updated path)
 const safaricomDealerConfigRef = firestore.collection('mpesa_settings').doc('main_config');
@@ -129,6 +132,55 @@ const c2bLimiter = rateLimit({
 app.use('/c2b-confirmation', c2bLimiter);
 app.use('/c2b-validation', c2bLimiter);
 
+
+let cachedDarajaAccessToken = null;
+let tokenExpiryTime = 0; // Timestamp when the current token expires
+
+async function getDarajaAccessToken() {
+    // Check if token is still valid
+    if (cachedDarajaAccessToken && Date.now() < tokenExpiryTime) {
+        logger.debug('🔑 Using cached Daraja access token.');
+        return cachedDarajaAccessToken;
+    }
+
+    logger.info('🔑 Generating new Daraja access token...');
+    try {
+        const consumerKey = process.env.DARAJA_CONSUMER_KEY;
+        const consumerSecret = process.env.DARAJA_CONSUMER_SECRET;
+        const oauthUrl = process.env.DARAJA_OAUTH_URL;
+
+        if (!consumerKey || !consumerSecret || !oauthUrl) {
+            throw new Error("Missing Daraja API credentials or OAuth URL in environment variables.");
+        }
+
+        // Base64 encode consumer key and secret
+        const authString = Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
+
+        const response = await axios.get(oauthUrl, {
+            headers: {
+                Authorization: `Basic ${authString}`,
+            },
+        });
+
+        const { access_token, expires_in } = response.data;
+
+        if (access_token && expires_in) {
+            cachedDarajaAccessToken = access_token;
+            // Set expiry time a bit before the actual expiry to avoid using an expired token
+            // Daraja tokens are usually valid for 3600 seconds (1 hour)
+            tokenExpiryTime = Date.now() + (expires_in * 1000) - (60 * 1000); // 1 minute buffer
+            logger.info(`✅ New Daraja access token generated. Expires in ${expires_in} seconds.`);
+            return cachedDarajaAccessToken;
+        } else {
+            logger.error('❌ Daraja OAuth response did not contain access_token or expires_in:', response.data);
+            throw new Error('Invalid Daraja OAuth response.');
+        }
+    } catch (error) {
+        const errorDetails = error.response ? JSON.stringify(error.response.data) : error.message;
+        logger.error(`❌ Failed to get Daraja access token: ${errorDetails}`);
+        throw new Error(`Failed to obtain Daraja access token: ${errorDetails}`);
+    }
+}
 
 let cachedAirtimeToken = null;
 let tokenExpiryTimestamp = 0;
@@ -295,8 +347,8 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
             return { status: 'FAILED', message: missingEnvError };
         }
 
-        const rawDealerPin = await getDealerServicePin(); // This will fetch from cache or Firestore
-        const servicePin = await generateServicePin(rawDealerPin); // Then encode it
+        const rawDealerPin = await getDealerServicePin(); 
+        const servicePin = await generateServicePin(rawDealerPin); 
 
         const body = {
             senderMsisdn: process.env.DEALER_SENDER_MSISDN,
@@ -319,6 +371,9 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
         let safaricomInternalTransId = null;
         let newSafaricomFloatBalance = null;
 
+        // --- CORRECTED: Check Safaricom API response status for actual success ---
+        const isSuccess = response.data && response.data.responseStatus === '200';
+
         if (response.data && response.data.responseDesc) {
             const desc = response.data.responseDesc;
             const idMatch = desc.match(/^(R\d{6}\.\d{4}\.\d{6})/); // Regex for the transaction ID
@@ -330,16 +385,35 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
                 newSafaricomFloatBalance = parseFloat(balanceMatch[1]);
             }
         }
+
+        // Always log the full response from Safaricom for debugging purposes
         logger.info('✅ Safaricom dealer airtime API response:', { receiver: normalizedReceiver, amount: amount, response_data: response.data });
-        return {
-            status: 'SUCCESS',
-            message: 'Safaricom airtime sent',
-            data: response.data,
-            safaricomInternalTransId: safaricomInternalTransId,
-            newSafaricomFloatBalance: newSafaricomFloatBalance,
-        };
+
+        if (isSuccess) {
+            return {
+                status: 'SUCCESS',
+                message: 'Safaricom airtime sent',
+                data: response.data,
+                safaricomInternalTransId: safaricomInternalTransId,
+                newSafaricomFloatBalance: newSafaricomFloatBalance,
+            };
+        } else {
+            // If the status code indicates failure, return FAILED
+            const errorMessage = `Safaricom Dealer API reported failure (Status: ${response.data.responseStatus || 'N/A'}): ${response.data.responseDesc || 'Unknown reason'}`;
+            logger.warn(`⚠️ Safaricom dealer airtime send reported non-success:`, {
+                receiver: receiverNumber,
+                amount: amount,
+                response_data: response.data,
+                errorMessage: errorMessage
+            });
+            return {
+                status: 'FAILED',
+                message: errorMessage,
+                error: response.data, // Provide the full response for debugging
+            };
+        }
     } catch (error) {
-        logger.error('❌ Safaricom dealer airtime send failed:', {
+        logger.error('❌ Safaricom dealer airtime send failed (exception caught):', {
             receiver: receiverNumber,
             amount: amount,
             message: error.message,
@@ -348,12 +422,11 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
         });
         return {
             status: 'FAILED',
-            message: 'Safaricom airtime send failed',
+            message: 'Safaricom airtime send failed due to network/API error',
             error: error.response ? error.response.data : error.message,
         };
     }
 }
-
 
 // Function to send Africa's Talking Airtime
 async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
@@ -429,6 +502,86 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
             status: 'FAILED',
             message: 'Africa\'s Talking airtime send failed (exception)',
             error: error.message,
+        };
+    }
+}
+
+// --- NEW: Daraja Reversal Function ---
+async function initiateDarajaReversal(transactionId, amount, receiverMsisdn, shortCode) {
+    logger.info(`🔄 Attempting Daraja reversal for TransID: ${transactionId}, Amount: ${amount}`);
+    try {
+        const accessToken = await getDarajaAccessToken(); // Function to get Daraja access token
+
+        if (!accessToken) {
+            throw new Error("Failed to get Daraja access token for reversal.");
+        }
+
+        const url = process.env.MPESA_REVERSAL_URL; // e.g., 'https://api.safaricom.co.ke/mpesa/reversal/v1/request'
+        const shortCode = process.env.MPESA_SHORTCODE; // Your M-Pesa Short Code / Paybill number
+        const initiator = process.env.MPESA_INITIATOR_NAME; // The Initiator Name (Business name)
+        const securityCredential = process.env.MPESA_SECURITY_CREDENTIAL; // Encrypted password (usually from a secure source)
+
+        if (!url || !shortCode || !initiator || !securityCredential) {
+            throw new Error("Missing Daraja reversal environment variables.");
+        }
+
+        const payload = {
+            Initiator: initiator,
+            SecurityCredential: securityCredential, // Use your actual security credential
+            CommandID: "TransactionReversal",
+            TransactionID: transactionId, // The M-Pesa TransID to be reversed
+            Amount: amount, // The amount to reverse
+            ReceiverPartyA: shortCode, // Your Short Code
+            ReceiverPartyB: receiverMsisdn, // The customer's MSISDN
+            QueueTimeoutURL: process.env.MPESA_REVERSAL_QUEUE_TIMEOUT_URL, // URL for timeout callbacks
+            ResultURL: process.env.MPESA_REVERSAL_RESULT_URL, // URL for result callbacks
+            Remarks: `Airtime dispatch failed for ${transactionId}`,
+            Occasion: "Failed Airtime Topup"
+        };
+
+        const headers = {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${accessToken}`
+        };
+
+        const response = await axios.post(url, payload, { headers });
+
+        logger.info(`✅ Daraja Reversal API response for TransID ${transactionId}:`, response.data);
+
+        // Daraja reversal API typically returns a `ResponseCode` and `ResponseDescription`
+        // A ResponseCode of '0' usually indicates that the request was accepted for processing.
+        // The actual success/failure of the reversal happens asynchronously via the ResultURL.
+        // For now, we'll consider '0' as "reversal initiated successfully".
+        if (response.data && response.data.ResponseCode === '0') {
+            return {
+                success: true,
+                message: "Reversal request accepted by Daraja.",
+                data: response.data,
+                // You might store the ConversationID for tracking if provided
+                conversationId: response.data.ConversationID || null,
+            };
+        } else {
+            const errorMessage = response.data ?
+                `Daraja reversal request failed: ${response.data.ResponseDescription || 'Unknown error'}` :
+                'Daraja reversal request failed with no response data.';
+            logger.error(`❌ Daraja reversal request not accepted for TransID ${transactionId}: ${errorMessage}`);
+            return {
+                success: false,
+                message: errorMessage,
+                data: response.data,
+            };
+        }
+
+    } catch (error) {
+        const errorData = error.response ? error.response.data : error.message;
+        logger.error(`❌ Exception during Daraja reversal for TransID ${transactionId}:`, {
+            error: errorData,
+            stack: error.stack
+        });
+        return {
+            success: false,
+            message: `Exception in reversal process: ${errorData.errorMessage || error.message}`,
+            error: errorData
         };
     }
 }
@@ -627,8 +780,6 @@ app.post('/c2b-confirmation', async (req, res) => {
         }
 
         // --- 3. Debit Carrier-Specific Float Balance & Record Airtime Sale attempt ---
-        // The float is debited by the ORIGINAL amount received from the customer.
-        // The bonus amount is "extra" and comes from the float, but the customer only paid the original.
         let floatUpdateResult;
         try {
             floatUpdateResult = await updateCarrierFloatBalance(carrierSpecificFloatLogicalName, -amount); // Debit original amount
@@ -768,8 +919,6 @@ app.post('/c2b-confirmation', async (req, res) => {
     }
   }
 }
-
-
         const updateSaleFields = {
             lastUpdated: FieldValue.serverTimestamp(), // Use server timestamp
             dispatchResult: airtimeDispatchResult.data || airtimeDispatchResult.error || airtimeDispatchResult, // Store raw API response/error
@@ -779,9 +928,6 @@ app.post('/c2b-confirmation', async (req, res) => {
         if (airtimeDispatchStatus === 'COMPLETED') { // Check the consolidated status
             updateSaleFields.status = airtimeDispatchStatus;
 
-            // Safaricom Specific Reconciliation: Only attempt if Safaricom was the target carrier
-            // and the primary Safaricom Dealer Portal was used and reported a new balance.
-            // If AT was used as fallback, this part won't apply.
             if (targetCarrier === 'Safaricom' && airtimeDispatchResult.newSafaricomFloatBalance !== null && airtimeProviderUsed === 'SafaricomDealer') {
                 try {
                     await safaricomFloatDocRef.update({
@@ -805,12 +951,6 @@ app.post('/c2b-confirmation', async (req, res) => {
                     });
                 }
             }
-            // For Africas Talking (both primary for Airtel/Telkom and fallback for Safaricom),
-            // your `updateCarrierFloatBalance` already debits the float based on the sale.
-            // No need for a separate `africasTalkingFloatDocRef.update` here unless AT provides a balance in its API response
-            // that you specifically want to use for reconciliation, similar to Safaricom's.
-            // Currently, your `sendAfricasTalkingAirtime` doesn't extract a `newAfricasTalkingFloatBalance`.
-
         } else {
             // Airtime dispatch ultimately failed (either primary or fallback)
             saleErrorMessage = saleErrorMessage || 'Airtime dispatch failed with no specific error message.'; // Ensure it's not null
@@ -841,28 +981,82 @@ app.post('/c2b-confirmation', async (req, res) => {
         await saleRef.update(updateSaleFields);
         logger.info(`✅ Updated sale document ${saleId} with dispatch result.`);
 
-        // --- 5. Update main transaction status based on airtime dispatch ---
-        await transactionsCollection.doc(transactionId).update({
-            status: airtimeDispatchStatus === 'COMPLETED' ? 'COMPLETED_AND_FULFILLED' : 'RECEIVED_FULFILLMENT_FAILED',
-            fulfillmentStatus: airtimeDispatchStatus,
-            fulfillmentDetails: airtimeDispatchResult,
-            lastUpdated: FieldValue.serverTimestamp(),
-            airtimeProviderUsed: airtimeProviderUsed, // Update transaction with provider used
-        });
+        // --- IMPORTANT NEW REVERSAL LOGIC STARTS HERE ---
+        if (airtimeDispatchStatus === 'FAILED') {
+            logger.warn(`🛑 Airtime dispatch ultimately failed for TransID ${transactionId}. Initiating Daraja reversal.`);
 
-        logger.info(`Final status for TransID ${transactionId}: ${airtimeDispatchStatus}`);
-        res.json({ "ResultCode": 0, "ResultDesc": "C2B Confirmation and Airtime Dispatch Processed." });
+            // Before attempting reversal, ensure we've updated the main transaction status to reflect failure
+            await transactionsCollection.doc(transactionId).update({
+                status: 'RECEIVED_FULFILLMENT_FAILED',
+                fulfillmentStatus: 'FAILED_DISPATCH_API',
+                fulfillmentDetails: airtimeDispatchResult,
+                errorMessage: saleErrorMessage,
+                lastUpdated: FieldValue.serverTimestamp(),
+                airtimeProviderUsed: airtimeProviderUsed,
+                reversalAttempted: true, // Mark that a reversal attempt is made
+            });
+
+            const reversalResult = await initiateDarajaReversal(transactionId, amount, mpesaNumber, BusinessShortCode); // Pass original amount and customer MSISDN
+
+            if (reversalResult.success) {
+                logger.info(`✅ Daraja reversal initiated successfully for TransID ${transactionId}.`);
+                await reconciledTransactionsCollection.doc(transactionId).set({
+                    transactionId: transactionId,
+                    amount: amount,
+                    mpesaNumber: mpesaNumber,
+                    reversalInitiatedAt: FieldValue.serverTimestamp(),
+                    reversalRequestDetails: reversalResult.data,
+                    originalCallbackData: callbackData,
+                    status: 'REVERSAL_INITIATED', // Will be updated by M-Pesa's ResultURL callback
+                    createdAt: FieldValue.serverTimestamp(),
+                });
+                await transactionsCollection.doc(transactionId).update({
+                    status: 'REVERSAL_PENDING_CONFIRMATION',
+                    lastUpdated: FieldValue.serverTimestamp(),
+                    reversalDetails: reversalResult.data,
+                });
+            } else {
+                logger.error(`❌ Daraja reversal failed to initiate for TransID ${transactionId}: ${reversalResult.message}`);
+                await failedReconciliationsCollection.doc(transactionId).set({
+                    transactionId: transactionId,
+                    amount: amount,
+                    mpesaNumber: mpesaNumber,
+                    reversalAttemptedAt: FieldValue.serverTimestamp(),
+                    reversalFailureDetails: reversalResult.error,
+                    originalCallbackData: callbackData,
+                    reason: reversalResult.message,
+                    createdAt: FieldValue.serverTimestamp(),
+                });
+                await transactionsCollection.doc(transactionId).update({
+                    status: 'REVERSAL_INITIATION_FAILED',
+                    lastUpdated: FieldValue.serverTimestamp(),
+                    reversalDetails: reversalResult.error,
+                    errorMessage: `Reversal initiation failed: ${reversalResult.message}`
+                });
+            }
+        } else {
+            // If airtime dispatch was COMPLETELY successful, update main transaction status
+            await transactionsCollection.doc(transactionId).update({
+                status: 'COMPLETED_AND_FULFILLED',
+                fulfillmentStatus: airtimeDispatchStatus,
+                fulfillmentDetails: airtimeDispatchResult,
+                lastUpdated: FieldValue.serverTimestamp(),
+                airtimeProviderUsed: airtimeProviderUsed,
+            });
+        }
+
+        logger.info(`Final status for TransID ${transactionId}: ${airtimeDispatchStatus === 'COMPLETED' ? 'COMPLETED_AND_FULFILLED' : 'REVERSAL_ATTEMPTED_OR_FAILED'}`);
+        res.json({ "ResultCode": 0, "ResultDesc": "C2B Confirmation and Airtime Dispatch Processed. Reversal initiated if failed." });
 
     } catch (error) {
         logger.error(`❌ CRITICAL ERROR in C2B Confirmation for TransID ${transactionId}:`, {
             message: error.message,
             stack: error.stack,
             callbackData: callbackData,
-            floatDebitedSuccessfully: floatDebitedSuccessfully, // Important for debugging
-            carrierSpecificFloatLogicalName: carrierSpecificFloatLogicalName, // Important for debugging
+            floatDebitedSuccessfully: floatDebitedSuccessfully,
+            carrierSpecificFloatLogicalName: carrierSpecificFloatLogicalName,
         });
 
-        // Attempt to update the transaction status to reflect the critical error
         if (transactionId) {
             try {
                 await transactionsCollection.doc(transactionId).update({
@@ -874,11 +1068,118 @@ app.post('/c2b-confirmation', async (req, res) => {
                 logger.error(`❌ Failed to update transaction ${transactionId} after critical error:`, updateError.message);
             }
         }
-
         res.json({ "ResultCode": 0, "ResultDesc": "Internal server error during processing." });
     }
 });
 
+//app.post('/daraja-reversal-result')
+app.post('/daraja-reversal-result', async (req, res) => {
+    const reversalResult = req.body;
+    logger.info('📞 Received Daraja Reversal Result Callback:', reversalResult);
+
+    const { TransactionID, ResultCode, ResultDesc } = reversalResult; // From Daraja's response structure
+
+    // Get the original transaction document
+    const transactionRef = transactionsCollection.doc(TransactionID);
+    const transactionDoc = await transactionRef.get();
+
+    if (!transactionDoc.exists) {
+        logger.warn(`⚠️ Reversal result received for unknown TransID: ${TransactionID}`);
+        return res.json({ "ResultCode": 0, "ResultDesc": "Acknowledged" });
+    }
+
+    // Update the transaction status based on reversal result
+    if (ResultCode === '0') { // Check Daraja's success code for actual reversal completion
+        logger.info(`✅ Reversal for TransID ${TransactionID} COMPLETED successfully.`);
+        await transactionRef.update({
+            status: 'REVERSED_SUCCESSFULLY',
+            reversalConfirmationDetails: reversalResult,
+            lastUpdated: FieldValue.serverTimestamp(),
+        });
+        await reconciledTransactionsCollection.doc(TransactionID).update({
+            status: 'REVERSAL_CONFIRMED',
+            reversalConfirmationDetails: reversalResult,
+            lastUpdated: FieldValue.serverTimestamp(),
+        });
+    } else {
+        logger.error(`❌ Reversal for TransID ${TransactionID} FAILED: ${ResultDesc}`);
+        await transactionRef.update({
+            status: 'REVERSAL_FAILED_CONFIRMATION',
+            reversalConfirmationDetails: reversalResult,
+            errorMessage: `Reversal failed: ${ResultDesc}`,
+            lastUpdated: FieldValue.serverTimestamp(),
+        });
+        await failedReconciliationsCollection.doc(TransactionID).doc(TransactionID).set({ // If you want to keep records in both
+            transactionId: TransactionID,
+            reversalConfirmationDetails: reversalResult,
+            reason: ResultDesc,
+            createdAt: FieldValue.serverTimestamp(),
+            
+        }, { merge: true }); 
+    }
+
+    res.json({ "ResultCode": 0, "ResultDesc": "Reversal result processed." });
+});
+
+// Add this new collection initialization at the top with your other collections
+const reversalTimeoutsCollection = firestore.collection('reversal_timeouts');
+
+// --- Daraja Reversal Queue Timeout Endpoint ---
+app.post('/daraja-reversal-timeout', async (req, res) => {
+    const timeoutData = req.body;
+    const now = new Date();
+    const { OriginatorConversationID, ConversationID, ResultCode, ResultDesc } = timeoutData;
+
+    logger.warn('⚠️ Received Daraja Reversal Queue Timeout Callback:', {
+        OriginatorConversationID: OriginatorConversationID,
+        ConversationID: ConversationID,
+        ResultCode: ResultCode,
+        ResultDesc: ResultDesc,
+        fullCallback: timeoutData
+    });
+
+    try {
+        let transactionIdToUpdate = OriginatorConversationID;
+
+        const originalTransactionRef = transactionsCollection.doc(transactionIdToUpdate);
+        const originalTransactionDoc = await originalTransactionRef.get();
+
+        if (originalTransactionDoc.exists) {
+            logger.info(`Updating transaction ${transactionIdToUpdate} with reversal timeout status.`);
+            await originalTransactionRef.update({
+                status: 'REVERSAL_TIMED_OUT', // New status for timed-out reversals
+                reversalTimeoutDetails: timeoutData,
+                lastUpdated: FieldValue.serverTimestamp(),
+            });
+        } else {
+            logger.warn(`⚠️ Reversal Timeout received for unknown or unlinked TransID/OriginatorConversationID: ${transactionIdToUpdate}`);
+        }
+
+        // Always record the timeout in a dedicated collection for auditing/manual review
+        await reversalTimeoutsCollection.add({
+            transactionId: transactionIdToUpdate, // The ID you're tracking internally
+            originatorConversationId: OriginatorConversationID,
+            conversationId: ConversationID,
+            resultCode: ResultCode,
+            resultDesc: ResultDesc,
+            fullCallbackData: timeoutData,
+            createdAt: FieldValue.serverTimestamp(),
+        });
+
+        logger.info(`✅ Daraja Reversal Queue Timeout processed for ${transactionIdToUpdate}.`);
+        res.json({ "ResultCode": 0, "ResultDesc": "Daraja Reversal Queue Timeout Received and Processed." });
+
+    } catch (error) {
+        logger.error(`❌ CRITICAL ERROR processing Daraja Reversal Queue Timeout for ${OriginatorConversationID || 'N/A'}:`, {
+            message: error.message,
+            stack: error.stack,
+            timeoutData: timeoutData
+        });
+        // Still send a success response to Daraja to avoid repeated callbacks
+        res.json({ "ResultCode": 0, "ResultDesc": "Internal server error during Queue Timeout processing." });
+    }
+});
+        
 // --- NEW AIRTIME BONUS API ENDPOINTS ---
 const CURRENT_BONUS_DOC_PATH = 'airtime_bonuses/current_settings'; // Document path for current settings
 const BONUS_HISTORY_COLLECTION = 'bonus_history'; // Collection for history logs
