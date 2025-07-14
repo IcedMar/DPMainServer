@@ -662,8 +662,8 @@ app.post('/c2b-validation', async (req, res) => {
             createdAt: now,
         });
         return res.json({
-            "ResultCode": 1, // Changed from C2B00013 to 1 as per M-Pesa API spec for rejection
-            "ResultDesc": `Invalid Amount`
+            "ResultCode": "CB00013",
+            "ResultDesc": "Rejected",
         });
     }
 
@@ -671,7 +671,7 @@ app.post('/c2b-validation', async (req, res) => {
     logger.info('✅ C2B Validation successful (amount check only):', { TransID: transactionIdentifier, Amount: TransAmount });
     res.json({
         "ResultCode": 0, // Accept
-        "ResultDesc": "Validation successful."
+        "ResultDesc": "Accepted"
     });
 });
 
