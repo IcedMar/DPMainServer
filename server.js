@@ -819,6 +819,10 @@ app.post('/c2b-confirmation', async (req, res) => {
                     if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
                         airtimeDispatchStatus = 'COMPLETED';
                         logger.info(`✅ Safaricom fallback airtime successfully sent via Africastalking for sale ${saleId}.`);
+                        // NEW: Adjust Africa's Talking float for 4% commission
+                        const commissionAmount = parseFloat((amount * 0.04).toFixed(2));
+                        await updateCarrierFloatBalance('africasTalkingFloat', commissionAmount);
+                        logger.info(`✅ Credited Africa's Talking float with ${commissionAmount} (4% commission) for TransID ${transactionId}.`);
                     } else {
                         saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'Africastalking fallback failed with no specific error.';
                         logger.error(`❌ Safaricom fallback via Africastalking failed for sale ${saleId}: ${saleErrorMessage}`);
@@ -839,6 +843,10 @@ app.post('/c2b-confirmation', async (req, res) => {
                 if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
                     airtimeDispatchStatus = 'COMPLETED';
                     logger.info(`✅ AfricasTalking airtime successfully sent directly for sale ${saleId}.`);
+                    // NEW: Adjust Africa's Talking float for 4% commission
+                    const commissionAmount = parseFloat((amount * 0.04).toFixed(2));
+                    await updateCarrierFloatBalance('africasTalkingFloat', commissionAmount);
+                    logger.info(`✅ Credited Africa's Talking float with ${commissionAmount} (4% commission) for TransID ${transactionId}.`);
                 } else {
                     saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.Safaricom : 'Africastalking direct dispatch failed with no specific error.';
                     logger.error(`❌ AfricasTalking direct dispatch failed for sale ${saleId}: ${saleErrorMessage}`);
@@ -939,7 +947,6 @@ app.post('/c2b-confirmation', async (req, res) => {
                 reversalAttempted: true, // Mark that a reversal attempt is made
             });
 
-            // FIX: Removed `BusinessShortCode` as it's undefined here and `initiateDarajaReversal` fetches it from env
             const reversalResult = await initiateDarajaReversal(transactionId, amount, mpesaNumber); 
 
             if (reversalResult.success) {
@@ -961,7 +968,6 @@ app.post('/c2b-confirmation', async (req, res) => {
                 });
             } else {
                 logger.error(`❌ Daraja reversal failed to initiate for TransID ${transactionId}: ${reversalResult.message}`);
-                // FIX: Removed duplicate .doc(TransactionID) - it should be .doc(transactionId).set(...)
                 await failedReconciliationsCollection.doc(transactionId).set({ 
                     transactionId: transactionId,
                     amount: amount,
@@ -998,7 +1004,6 @@ app.post('/c2b-confirmation', async (req, res) => {
             message: error.message,
             stack: error.stack,
             callbackData: callbackData,
-            // Removed floatDebitedSuccessfully and carrierSpecificFloatLogicalName as they are now managed locally within dispatch logic
         });
 
         if (transactionId) {
@@ -1012,7 +1017,6 @@ app.post('/c2b-confirmation', async (req, res) => {
                 logger.error(`❌ Failed to update transaction ${transactionId} after critical error:`, updateError.message);
             }
         }
-        // Changed ResultDesc to indicate internal error, while keeping ResultCode 0 for Daraja acknowledgement
         res.json({ "ResultCode": 0, "ResultDesc": "Internal server error during processing. Please check logs." });
     }
 });
@@ -1054,7 +1058,6 @@ app.post('/daraja-reversal-result', async (req, res) => {
             errorMessage: `Reversal failed: ${ResultDesc}`,
             lastUpdated: FieldValue.serverTimestamp(),
         });
-        // FIX: Corrected duplicate .doc(TransactionID)
         await failedReconciliationsCollection.doc(TransactionID).set({ 
             transactionId: TransactionID,
             reversalConfirmationDetails: reversalResult,
