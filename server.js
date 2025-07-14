@@ -7,13 +7,11 @@ const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const { getAuth } = require('firebase-admin/auth');
 const axios = require('axios');
 const winston = require('winston');
-const winstonFirebase = require('winston-firebase');
-const Bottleneck = require('bottleneck'); 
+const winstonFirebase = require('winston-firebase'); // Although not used, keeping as per "without changing or adding unnecessary packages"
+const Bottleneck = require('bottleneck');
 
-// Load environment variables from .env file
 require('dotenv').config();
 
-// Initialize Firebase Admin SDK
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
 
 initializeApp({
@@ -23,7 +21,6 @@ initializeApp({
 const firestore = getFirestore();
 const auth = getAuth();
 
-// Initialize Winston Logger
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.json(),
@@ -35,67 +32,56 @@ const logger = winston.createLogger({
                 winston.format.simple()
             ),
         }),
-        // Add Firebase transport if needed for cloud logging
-        // new winstonFirebase(firebaseConfig),
     ],
 });
 
-// Uncaught Exceptions & Unhandled Rejections
 process.on('uncaughtException', (error) => {
     logger.error('Uncaught Exception:', { message: error.message, stack: error.stack });
-    process.exit(1); // Exit with a failure code
+    process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
     logger.error('Unhandled Rejection at:', { promise, reason: reason.message, stack: reason.stack });
-    // Do not exit, allow the process to continue unless it's a critical error
 });
 
-// Africa's Talking SDK Initialization
 const AfricasTalking = require('africastalking');
 const africastalking = AfricasTalking({
     apiKey: process.env.AT_API_KEY,
     username: process.env.AT_USERNAME
 });
 
-// Express App Initialization
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Security Middlewares
 app.use(helmet());
 app.use(cors());
-app.use(express.json()); // For parsing application/json
+app.use(express.json());
 
-// Rate Limiting for public facing endpoints (adjust as needed)
 const rateLimit = require('express-rate-limit');
 const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // Limit each IP to 100 requests per window
+    windowMs: 15 * 60 * 1000,
+    max: 100,
     message: 'Too many requests from this IP, please try again after 15 minutes',
 });
 app.use(apiLimiter);
 
-// Firestore Collection References
 const transactionsCollection = firestore.collection('transactions');
 const salesCollection = firestore.collection('sales');
 const errorsCollection = firestore.collection('errors');
 const safaricomFloatDocRef = firestore.collection('floats').doc('safaricomFloat');
 const africasTalkingFloatDocRef = firestore.collection('floats').doc('africasTalkingFloat');
 const bonusHistoryCollection = firestore.collection('airtime_bonus_history');
-const mpesaSettingsDocRef = firestore.collection('mpesa_settings').doc('credentials'); // For Daraja consumer key/secret
+const mpesaSettingsDocRef = firestore.collection('mpesa_settings').doc('credentials');
 const reconciledTransactionsCollection = firestore.collection('reconciled_transactions');
 const failedReconciliationsCollection = firestore.collection('failed_reconciliations');
 const reversalTimeoutsCollection = firestore.collection('daraja_reversal_timeouts');
 
-// Global variable for Safaricom Dealer API Token and its expiry
 let safaricomDealerAccessToken = null;
 let safaricomDealerTokenExpiry = 0;
 
-// Rate limiter for Safaricom Dealer API to avoid exceeding limits
 const safaricomApiLimiter = new Bottleneck({
-    minTime: 500, // At most 2 requests per second
-    maxConcurrent: 1, // Process requests one at a time
+    minTime: 500,
+    maxConcurrent: 1,
 });
 
 async function getDarajaAccessToken() {
@@ -138,10 +124,8 @@ async function getDarajaAccessToken() {
     }
 }
 
-// Function to fetch Safaricom Dealer API token
 async function getSafaricomDealerAccessToken() {
     const now = Date.now();
-    // Check if token exists and is not expired
     if (safaricomDealerAccessToken && safaricomDealerTokenExpiry > now) {
         logger.info('✅ Using cached Safaricom Dealer API token.');
         return safaricomDealerAccessToken;
@@ -173,7 +157,6 @@ async function getSafaricomDealerAccessToken() {
 
         if (response.data && response.data.token && response.data.expiresIn) {
             safaricomDealerAccessToken = response.data.token;
-            // Set expiry time a bit before actual expiry to be safe (e.g., 5 minutes before)
             safaricomDealerTokenExpiry = now + (response.data.expiresIn * 1000) - (5 * 60 * 1000);
             logger.info('✅ Successfully fetched new Safaricom Dealer API token.');
             return safaricomDealerAccessToken;
@@ -192,10 +175,9 @@ async function getSafaricomDealerAccessToken() {
     }
 }
 
-// Function to generate Safaricom Dealer PIN (cached)
 let cachedServicePin = null;
 let pinLastFetched = 0;
-const PIN_CACHE_DURATION = 1 * 60 * 60 * 1000; // Cache for 1 hour
+const PIN_CACHE_DURATION = 1 * 60 * 60 * 1000;
 
 async function getCachedServicePin() {
     const now = Date.now();
@@ -223,36 +205,30 @@ async function getCachedServicePin() {
     }
 }
 
-// Function to detect carrier based on phone number prefix
 function detectCarrier(phoneNumber) {
-    const cleanedNumber = phoneNumber.replace(/\D/g, ''); // Remove non-digits
+    const cleanedNumber = phoneNumber.replace(/\D/g, '');
     const prefix = cleanedNumber.startsWith('254') ? cleanedNumber.substring(3, 5) : cleanedNumber.substring(0, 2);
 
-    // Safaricom prefixes
     const safaricomPrefixes = ['70', '71', '72', '74', '75', '76', '79', '10'];
     if (safaricomPrefixes.includes(prefix) || cleanedNumber.startsWith('07') || cleanedNumber.startsWith('01')) {
         return 'Safaricom';
     }
 
-    // Airtel prefixes
     const airtelPrefixes = ['73', '78'];
     if (airtelPrefixes.includes(prefix)) {
         return 'Airtel';
     }
 
-    // Telkom prefixes
     const telkomPrefixes = ['77'];
     if (telkomPrefixes.includes(prefix)) {
         return 'Telkom';
     }
 
-    // Equitel prefixes
-    const equitelPrefixes = ['764', '765']; // Assuming '764' and '765' for Equitel
+    const equitelPrefixes = ['764', '765'];
     if (cleanedNumber.startsWith('254764') || cleanedNumber.startsWith('254765')) {
         return 'Equitel';
     }
 
-    // Faiba prefixes
     const faibaPrefixes = ['747', '748'];
     if (cleanedNumber.startsWith('254747') || cleanedNumber.startsWith('254748')) {
         return 'Faiba';
@@ -261,8 +237,6 @@ function detectCarrier(phoneNumber) {
     return 'Unknown';
 }
 
-
-// Function to send Safaricom Airtime via Dealer Portal
 async function sendSafaricomAirtime(phoneNumber, amount) {
     let normalizedPhone = phoneNumber;
     if (phoneNumber.startsWith('0')) {
@@ -293,7 +267,7 @@ async function sendSafaricomAirtime(phoneNumber, amount) {
 
             const payload = {
                 pin: servicePin,
-                amount: parseFloat(amount).toFixed(2), // Ensure amount is float with 2 decimal places
+                amount: parseFloat(amount).toFixed(2),
                 msisdn: normalizedPhone
             };
 
@@ -304,7 +278,6 @@ async function sendSafaricomAirtime(phoneNumber, amount) {
 
             const response = await axios.post(url, payload, { headers });
 
-            // Safaricom Dealer API response structure might vary, adjust this based on actual API docs
             const dealerResponse = response.data;
             if (dealerResponse.status === 'success' || dealerResponse.code === '200' || dealerResponse.message === 'Request processed successfully') {
                 logger.info(`✅ Safaricom airtime successfully sent to ${normalizedPhone}:`, {
@@ -315,7 +288,6 @@ async function sendSafaricomAirtime(phoneNumber, amount) {
                     status: 'SUCCESS',
                     message: 'Safaricom airtime sent',
                     data: dealerResponse,
-                    // Assuming the dealer API returns the new float balance directly in a field like 'newBalance'
                     newSafaricomFloatBalance: dealerResponse.currentBalance || null
                 };
             } else {
@@ -328,7 +300,7 @@ async function sendSafaricomAirtime(phoneNumber, amount) {
                     status: 'FAILED',
                     message: 'Safaricom Dealer airtime send failed.',
                     error: errorMessage,
-                    data: dealerResponse, // Return full response for debugging
+                    data: dealerResponse,
                 };
             }
         } catch (error) {
@@ -349,7 +321,6 @@ async function sendSafaricomAirtime(phoneNumber, amount) {
     });
 }
 
-// Function to send Africa's Talking Airtime
 async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
     let normalizedPhone = phoneNumber;
 
@@ -393,10 +364,10 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
                 at_response: result
             });
             return {
-                status: 'INITIATED', // Changed to 'INITIATED' to signify not yet final completion
+                status: 'INITIATED',
                 message: 'Africa\'s Talking airtime initiated, awaiting final callback',
                 data: result,
-                at_requestId: response.requestId, // EXPOSE THE REQUEST_ID
+                at_requestId: response.requestId,
             };
         } else {
             logger.error(`❌ Africa's Talking airtime send indicates non-success for ${carrier}:`, {
@@ -426,7 +397,6 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
     }
 }
 
-// Daraja Reversal Function
 async function initiateDarajaReversal(transactionId, amount, receiverMsisdn) {
     logger.info(`🔄 Attempting Daraja reversal for TransID: ${transactionId}, Amount: ${amount}`);
     try {
@@ -501,13 +471,6 @@ async function initiateDarajaReversal(transactionId, amount, receiverMsisdn) {
     }
 }
 
-/**
- * Updates the float balance for a specific carrier.
- * @param {string} carrierLogicalName - 'safaricomFloat' or 'africasTalkingFloat'
- * @param {number} amount - The amount to add (positive) or subtract (negative)
- * @returns {Promise<object>} - { success: true, newBalance: number }
- * @throws {Error} if balance goes below zero or doc is invalid
- */
 async function updateCarrierFloatBalance(carrierLogicalName, amount) {
     return firestore.runTransaction(async t => {
         let floatDocRef;
@@ -550,9 +513,6 @@ async function updateCarrierFloatBalance(carrierLogicalName, amount) {
     });
 }
 
-// C2B (Offline Paybill) Callbacks
-
-// C2B Validation Endpoint
 app.post('/c2b-validation', async (req, res) => {
     const callbackData = req.body;
     const transactionIdentifier = callbackData.TransID || `C2B_VALIDATION_${Date.now()}`;
@@ -585,7 +545,6 @@ app.post('/c2b-validation', async (req, res) => {
     });
 });
 
-// C2B Confirmation Endpoint (Mandatory)
 app.post('/c2b-confirmation', async (req, res) => {
     const callbackData = req.body;
     const transactionId = callbackData.TransID;
@@ -692,7 +651,7 @@ app.post('/c2b-confirmation', async (req, res) => {
             dispatchAttemptedAt: FieldValue.serverTimestamp(),
             createdAt: FieldValue.serverTimestamp(),
             lastUpdated: FieldValue.serverTimestamp(),
-            payerMsisdn: mpesaNumber, // Store for potential reversal
+            payerMsisdn: mpesaNumber,
         });
         logger.info(`✅ Initialized sale document ${saleId} in 'sales' collection for TransID ${transactionId} with bonus details.`);
 
@@ -717,8 +676,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                     airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
 
                     if (airtimeDispatchResult && airtimeDispatchResult.status === 'INITIATED') {
-                        airtimeDispatchStatus = 'PENDING_AT_CONFIRMATION'; // NEW: Intermediate status
-                        updateSaleFields.at_requestId = airtimeDispatchResult.at_requestId; // NEW: Store AT requestId
+                        airtimeDispatchStatus = 'PENDING_AT_CONFIRMATION';
                         logger.info(`✅ Safaricom fallback airtime initiated via AfricasTalking for sale ${saleId}. AT Request ID: ${airtimeDispatchResult.at_requestId}`);
                         const commissionAmount = parseFloat((amount * 0.04).toFixed(2));
                         await updateCarrierFloatBalance('africasTalkingFloat', commissionAmount);
@@ -726,7 +684,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                     } else {
                         saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'Africastalking fallback failed with no specific error.';
                         logger.error(`❌ Safaricom fallback via Africastalking failed for sale ${saleId}: ${saleErrorMessage}`);
-                        airtimeDispatchStatus = 'FAILED'; // Fallback also failed
+                        airtimeDispatchStatus = 'FAILED';
                     }
                 }
             } catch (dispatchError) {
@@ -742,8 +700,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                 airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
 
                 if (airtimeDispatchResult && airtimeDispatchResult.status === 'INITIATED') {
-                    airtimeDispatchStatus = 'PENDING_AT_CONFIRMATION'; // NEW: Intermediate status
-                    updateSaleFields.at_requestId = airtimeDispatchResult.at_requestId; // NEW: Store AT requestId
+                    airtimeDispatchStatus = 'PENDING_AT_CONFIRMATION';
                     logger.info(`✅ AfricasTalking airtime initiated directly for sale ${saleId}. AT Request ID: ${airtimeDispatchResult.at_requestId}`);
                     const commissionAmount = parseFloat((amount * 0.04).toFixed(2));
                     await updateCarrierFloatBalance('africasTalkingFloat', commissionAmount);
@@ -751,7 +708,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                 } else {
                     saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'Africastalking direct dispatch failed with no specific error.';
                     logger.error(`❌ AfricasTalking direct dispatch failed for sale ${saleId}: ${saleErrorMessage}`);
-                    airtimeDispatchStatus = 'FAILED'; // AT direct dispatch failed
+                    airtimeDispatchStatus = 'FAILED';
                 }
             } catch (dispatchError) {
                 saleErrorMessage = `AfricasTalking direct dispatch process failed (or float debit failed): ${dispatchError.message}`;
@@ -804,8 +761,8 @@ app.post('/c2b-confirmation', async (req, res) => {
                 }
             }
         } else if (airtimeDispatchStatus === 'PENDING_AT_CONFIRMATION') {
-            updateSaleFields.status = airtimeDispatchStatus; // Keep PENDING status
-            updateSaleFields.at_requestId = airtimeDispatchResult.at_requestId; // Ensure AT Request ID is saved
+            updateSaleFields.status = airtimeDispatchStatus;
+            updateSaleFields.at_requestId = airtimeDispatchResult.at_requestId;
         }
         else {
             saleErrorMessage = saleErrorMessage || 'Airtime dispatch failed with no specific error message.';
@@ -836,7 +793,7 @@ app.post('/c2b-confirmation', async (req, res) => {
         await saleRef.update(updateSaleFields);
         logger.info(`✅ Updated sale document ${saleId} with dispatch result.`);
 
-        if (airtimeDispatchStatus === 'FAILED_DISPATCH_API') { // Only reverse if ultimately failed
+        if (airtimeDispatchStatus === 'FAILED_DISPATCH_API') {
             logger.warn(`🛑 Airtime dispatch ultimately failed for TransID ${transactionId}. Initiating Daraja reversal.`);
 
             await transactionsCollection.doc(transactionId).update({
@@ -889,7 +846,7 @@ app.post('/c2b-confirmation', async (req, res) => {
             }
         } else if (airtimeDispatchStatus === 'COMPLETED' || airtimeDispatchStatus === 'PENDING_AT_CONFIRMATION') {
             await transactionsCollection.doc(transactionId).update({
-                status: 'COMPLETED_AND_FULFILLED', // For Safaricom success directly or AT pending
+                status: 'COMPLETED_AND_FULFILLED',
                 fulfillmentStatus: airtimeDispatchStatus,
                 fulfillmentDetails: airtimeDispatchResult,
                 lastUpdated: FieldValue.serverTimestamp(),
@@ -897,7 +854,7 @@ app.post('/c2b-confirmation', async (req, res) => {
             });
         }
 
-        logger.info(`Final status for TransID ${transactionId}: ${airtimeDispatchStatus === 'COMPLETED' || airtimeDispatchStatus === 'PENDING_AT_CONFIRMATION' ? 'COMPLETED_AND_FULFILLED (or pending AT confirmation)' : 'REVERSAL_ATTEMPTED_OR_FAILED'}`);
+        logger.info(`Final status for TransID ${transactionId}: ${airtimeDispatchStatus === 'COMPLETED' ? 'COMPLETED_AND_FULFILLED' : (airtimeDispatchStatus === 'PENDING_AT_CONFIRMATION' ? 'PENDING_AT_CONFIRMATION' : 'REVERSAL_ATTEMPTED_OR_FAILED')}`);
         res.json({ "ResultCode": 0, "ResultDesc": "C2B Confirmation and Airtime Dispatch Processed. Reversal initiated if failed." });
 
     } catch (error) {
@@ -1027,7 +984,6 @@ app.post('/africastalking-airtime-status', async (req, res) => {
 });
 
 
-// Daraja Reversal Result Endpoint
 app.post('/daraja-reversal-result', async (req, res) => {
     const reversalResult = req.body;
     logger.info('📞 Received Daraja Reversal Result Callback:', reversalResult);
@@ -1073,7 +1029,6 @@ app.post('/daraja-reversal-result', async (req, res) => {
     res.json({ "ResultCode": 0, "ResultDesc": "Reversal result processed." });
 });
 
-// Daraja Reversal Queue Timeout Endpoint
 app.post('/daraja-reversal-timeout', async (req, res) => {
     const timeoutData = req.body;
     const { OriginatorConversationID, ConversationID, ResultCode, ResultDesc } = timeoutData;
@@ -1126,10 +1081,8 @@ app.post('/daraja-reversal-timeout', async (req, res) => {
     }
 });
 
-// NEW AIRTIME BONUS API ENDPOINTS
 const CURRENT_BONUS_DOC_PATH = 'airtime_bonuses/current_settings';
 
-// GET current bonus percentages
 app.get('/api/airtime-bonuses/current', async (req, res) => {
     try {
         const docRef = firestore.collection('airtime_bonuses').doc('current_settings');
@@ -1148,7 +1101,6 @@ app.get('/api/airtime-bonuses/current', async (req, res) => {
     }
 });
 
-// POST to update bonus percentages and log history
 app.post('/api/airtime-bonuses/update', async (req, res) => {
     const { safaricomPercentage, africastalkingPercentage, actor } = req.body;
 
@@ -1200,7 +1152,6 @@ app.post('/api/airtime-bonuses/update', async (req, res) => {
     }
 });
 
-// Start the server
 app.listen(PORT, () => {
     logger.info(`Server running on port ${PORT}`);
     console.log(`Server running on port ${PORT}`);
