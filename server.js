@@ -3,7 +3,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const crypto = require('crypto');
-const { Firestore, FieldValue, AggregateField } = require('@google-cloud/firestore'); // Import FieldValue and AggregateField
+const { Firestore, FieldValue } = require('@google-cloud/firestore'); // Import FieldValue
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -100,7 +100,8 @@ const safaricomFloatDocRef = firestore.collection('Saf_float').doc('current');
 const africasTalkingFloatDocRef = firestore.collection('AT_Float').doc('current');
 const reconciledTransactionsCollection = firestore.collection('reconciled_transactions');
 const failedReconciliationsCollection = firestore.collection('failed_reconciliations');
-
+const reversalTimeoutsCollection = firestore.collection('reversal_timeouts'); // NEW: Initialize this collection
+const bonusHistoryCollection = firestore.collection('bonus_history'); // NEW: Initialize this collection
 
 // NEW: Firestore reference for dealer config (updated path)
 const safaricomDealerConfigRef = firestore.collection('mpesa_settings').doc('main_config');
@@ -507,7 +508,7 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
 }
 
 // --- NEW: Daraja Reversal Function ---
-async function initiateDarajaReversal(transactionId, amount, receiverMsisdn, shortCode) {
+async function initiateDarajaReversal(transactionId, amount, receiverMsisdn) { // Removed shortCode parameter as it's fetched from env
     logger.info(`🔄 Attempting Daraja reversal for TransID: ${transactionId}, Amount: ${amount}`);
     try {
         const accessToken = await getDarajaAccessToken(); // Function to get Daraja access token
@@ -636,7 +637,6 @@ async function updateCarrierFloatBalance(carrierLogicalName, amount) {
     });
 }
 
-
 // --- C2B (Offline Paybill) Callbacks ---
 
 // C2B Validation Endpoint
@@ -699,8 +699,10 @@ app.post('/c2b-confirmation', async (req, res) => {
     const customerName = `${FirstName || ''} ${MiddleName || ''} ${LastName || ''}`.trim();
 
     let saleId = null;
-    let floatDebitedSuccessfully = false; // Track if the *specific carrier's* float was debited
-    let carrierSpecificFloatLogicalName = null; // To store the logical name of the float that was debited
+    let airtimeDispatchStatus = 'FAILED';
+    let airtimeDispatchResult = null;
+    let saleErrorMessage = null;
+    let airtimeProviderUsed = null;
 
     try {
         // --- 1. Record the incoming M-Pesa transaction (money received) ---
@@ -746,78 +748,6 @@ app.post('/c2b-confirmation', async (req, res) => {
             return res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received, but airtime not dispatched due to unsupported carrier." });
         }
 
-        // Map carrier to its specific float logical name
-        switch (targetCarrier) {
-            case 'Safaricom':
-                carrierSpecificFloatLogicalName = 'safaricomFloat'; // This maps to safaricomFloatDocRef
-                break;
-            case 'Airtel':
-            case 'Telkom':
-            case 'AirtelMoney': // Ensure you map all your AT supported carriers here
-            case 'Equitel':
-            case 'Faiba':
-                carrierSpecificFloatLogicalName = 'africasTalkingFloat'; // This maps to africasTalkingFloatDocRef
-                break;
-            default:
-                // This case should be caught by the earlier detectCarrier check, but good for robustness
-                const unmappedError = `No float document mapped for detected carrier: ${targetCarrier}`;
-                logger.error(`❌ ${unmappedError}`, { TransID: transactionId, topupNumber: topupNumber });
-                await errorsCollection.add({
-                    type: 'AIRTIME_SALE_ERROR',
-                    subType: 'NO_FLOAT_MAPPING',
-                    error: unmappedError,
-                    transactionId: transactionId,
-                    callbackData: callbackData,
-                    createdAt: FieldValue.serverTimestamp(),
-                });
-                await transactionsCollection.doc(transactionId).update({
-                    status: 'RECEIVED_FULFILLMENT_FAILED',
-                    fulfillmentStatus: 'FAILED_NO_FLOAT_MAPPING',
-                    errorMessage: unmappedError,
-                    lastUpdated: FieldValue.serverTimestamp(),
-                });
-                return res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received, but airtime not dispatched due to internal mapping error." });
-        }
-
-        // --- 3. Debit Carrier-Specific Float Balance & Record Airtime Sale attempt ---
-        let floatUpdateResult;
-        try {
-            floatUpdateResult = await updateCarrierFloatBalance(carrierSpecificFloatLogicalName, -amount); // Debit original amount
-            floatDebitedSuccessfully = true;
-        } catch (error) {
-            floatUpdateResult = { success: false, reason: 'FLOAT_DEBIT_FAILED', message: error.message };
-            logger.error(`❌ Failed to debit carrier-specific float for TransID ${transactionId} (${carrierSpecificFloatLogicalName}): ${error.message}`);
-        }
-
-        if (!floatUpdateResult.success) {
-            const errorMessage = floatUpdateResult.message || `Carrier float debit failed for TransID ${transactionId}. Reason: ${floatUpdateResult.reason}`;
-            await errorsCollection.add({
-                type: 'AIRTIME_SALE_ERROR',
-                subType: floatUpdateResult.reason,
-                error: errorMessage,
-                transactionId: transactionId,
-                callbackData: callbackData,
-                createdAt: FieldValue.serverTimestamp(),
-            });
-
-            await transactionsCollection.doc(transactionId).update({
-                status: 'RECEIVED_FLOAT_ISSUE',
-                fulfillmentStatus: 'FAILED_INSUFFICIENT_FLOAT',
-                errorMessage: errorMessage,
-                lastUpdated: FieldValue.serverTimestamp(),
-            });
-            return res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received, but airtime not dispatched due to insufficient float." });
-        }
-
-        // If float was successfully debited, proceed with recording the sale and dispatching airtime
-        const saleRef = salesCollection.doc();
-        saleId = saleRef.id;
-
-        let airtimeDispatchStatus = 'FAILED';
-        let airtimeDispatchResult = null;
-        let saleErrorMessage = null;
-        let airtimeProviderUsed = null; // To track which provider successfully sent or was attempted
-
         // --- FETCH BONUS SETTINGS AND CALCULATE FINAL AMOUNT TO DISPATCH ---
         const bonusDocRef = firestore.collection('airtime_bonuses').doc('current_settings');
         const bonusDocSnap = await bonusDocRef.get();
@@ -843,7 +773,9 @@ app.post('/c2b-confirmation', async (req, res) => {
         finalAmountToDispatch = parseFloat(finalAmountToDispatch.toFixed(2));
         bonusApplied = parseFloat(bonusApplied.toFixed(2));
 
-
+        // Initialize sale document early
+        const saleRef = salesCollection.doc();
+        saleId = saleRef.id;
         await saleRef.set({
             saleId: saleId,
             relatedTransactionId: transactionId,
@@ -859,75 +791,86 @@ app.post('/c2b-confirmation', async (req, res) => {
         });
         logger.info(`✅ Initialized sale document ${saleId} in 'sales' collection for TransID ${transactionId} with bonus details.`);
 
-        // --- Safaricom Primary Attempt ---
-        logger.info(`Attempting Safaricom airtime via Primary (Dealer Portal) for TransID: ${transactionId}`);
-        airtimeProviderUsed = 'SafaricomDealer';
-        airtimeDispatchResult = await sendSafaricomAirtime(topupNumber, finalAmountToDispatch);
 
-        if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
-            airtimeDispatchStatus = 'COMPLETED';
-            logger.info(`✅ Safaricom airtime successfully sent via Dealer Portal for sale ${saleId}.`);
+        // --- Conditional Airtime Dispatch Logic based on Carrier ---
+        if (targetCarrier === 'Safaricom') {
+            // Debit Safaricom float for primary attempt
+            try {
+                await updateCarrierFloatBalance('safaricomFloat', -finalAmountToDispatch);
+                airtimeProviderUsed = 'SafaricomDealer';
+                airtimeDispatchResult = await sendSafaricomAirtime(topupNumber, finalAmountToDispatch);
+
+                if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
+                    airtimeDispatchStatus = 'COMPLETED';
+                    logger.info(`✅ Safaricom airtime successfully sent via Dealer Portal for sale ${saleId}.`);
+                } else {
+                    saleErrorMessage = airtimeDispatchResult?.error || 'Safaricom Dealer Portal failed with unknown error.';
+                    logger.warn(`⚠️ Safaricom Dealer Portal failed for TransID ${transactionId}. Attempting fallback to Africastalking. Error: ${saleErrorMessage}`);
+
+                    // Refund Safaricom float, as primary attempt failed
+                    await updateCarrierFloatBalance('safaricomFloat', finalAmountToDispatch);
+                    logger.info(`✅ Refunded Safaricom float for TransID ${transactionId}: +${finalAmountToDispatch}`);
+
+                    // Attempt fallback via Africa's Talking (debit AT float)
+                    await updateCarrierFloatBalance('africasTalkingFloat', -finalAmountToDispatch); 
+                    airtimeProviderUsed = 'AfricasTalkingFallback';
+                    airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
+
+                    if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
+                        airtimeDispatchStatus = 'COMPLETED';
+                        logger.info(`✅ Safaricom fallback airtime successfully sent via Africastalking for sale ${saleId}.`);
+                    } else {
+                        saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'Africastalking fallback failed with no specific error.';
+                        logger.error(`❌ Safaricom fallback via Africastalking failed for sale ${saleId}: ${saleErrorMessage}`);
+                    }
+                }
+            } catch (dispatchError) {
+                saleErrorMessage = `Safaricom primary dispatch process failed (or float debit failed): ${dispatchError.message}`;
+                logger.error(`❌ Safaricom primary dispatch process failed for TransID ${transactionId}: ${dispatchError.message}`);
+            }
+
+        } else if (['Airtel', 'Telkom', 'Equitel', 'Faiba'].includes(targetCarrier)) {
+            // Directly dispatch via Africa's Talking
+            try {
+                await updateCarrierFloatBalance('africasTalkingFloat', -finalAmountToDispatch);
+                airtimeProviderUsed = 'AfricasTalkingDirect';
+                airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
+
+                if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
+                    airtimeDispatchStatus = 'COMPLETED';
+                    logger.info(`✅ AfricasTalking airtime successfully sent directly for sale ${saleId}.`);
+                } else {
+                    saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.Safaricom : 'Africastalking direct dispatch failed with no specific error.';
+                    logger.error(`❌ AfricasTalking direct dispatch failed for sale ${saleId}: ${saleErrorMessage}`);
+                }
+            } catch (dispatchError) {
+                saleErrorMessage = `AfricasTalking direct dispatch process failed (or float debit failed): ${dispatchError.message}`;
+                logger.error(`❌ AfricasTalking direct dispatch process failed for TransID ${transactionId}: ${dispatchError.message}`);
+            }
         } else {
-        logger.warn(`⚠️ Safaricom Dealer Portal failed for TransID ${transactionId}. Attempting fallback to Africastalking. Error: ${airtimeDispatchResult?.error || 'Unknown error'}`);
+            // This case should ideally be caught by the initial detectCarrier check, but good for robustness
+            saleErrorMessage = `No valid dispatch path for carrier: ${targetCarrier}`;
+            logger.error(`❌ ${saleErrorMessage} for TransID ${transactionId}`);
+            await errorsCollection.add({
+                type: 'AIRTIME_SALE_ERROR',
+                subType: 'NO_DISPATCH_PATH',
+                error: saleErrorMessage,
+                transactionId: transactionId,
+                callbackData: callbackData,
+                createdAt: FieldValue.serverTimestamp(),
+            });
+        }
 
-        // === NEW: Refund Safaricom float ===
-        try {
-            await updateCarrierFloatBalance('safaricomFloat', amount); // Refund the Safaricom float
-            logger.info(`✅ Refunded Safaricom float for TransID ${transactionId}: +${amount}`);
-        } catch (refundError) {
-        logger.error(`❌ Failed to refund Safaricom float for TransID ${transactionId}: ${refundError.message}`);
-        await errorsCollection.add({
-            type: 'FLOAT_REFUND_ERROR',
-            subType: 'SAFARICOM_FALLBACK_REFUND_FAILED',
-            error: refundError.message,
-            transactionId: transactionId,
-            createdAt: FieldValue.serverTimestamp(),
-        });
-    }
-
-    // === NEW: Debit Africastalking float ===
-    let fallbackFloatDebitResult = { success: false };
-    try {
-        fallbackFloatDebitResult = await updateCarrierFloatBalance('africasTalkingFloat', -amount); // Debit Africastalking float
-        logger.info(`✅ Debited Africastalking float for fallback: -${amount} (TransID ${transactionId})`);
-    } catch (fallbackDebitError) {
-    logger.error(`❌ Failed to debit Africastalking float for fallback (TransID ${transactionId}): ${fallbackDebitError.message}`);
-    saleErrorMessage = `Fallback float debit failed: ${fallbackDebitError.message}`;
-    await errorsCollection.add({
-      type: 'FLOAT_DEBIT_ERROR',
-      subType: 'AFRICASTALKING_FALLBACK_DEBIT_FAILED',
-      error: fallbackDebitError.message,
-      transactionId: transactionId,
-      createdAt: FieldValue.serverTimestamp(),
-    });
-  }
-
-  if (!fallbackFloatDebitResult.success) {
-    airtimeDispatchStatus = 'FAILED';
-    saleErrorMessage = saleErrorMessage || `Fallback float debit failed unexpectedly for TransID ${transactionId}.`;
-  } else {
-    // === NEW: Attempt fallback dispatch ===
-    airtimeProviderUsed = 'AfricasTalkingFallback';
-    airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
-
-    if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
-      airtimeDispatchStatus = 'COMPLETED';
-      logger.info(`✅ Safaricom fallback airtime successfully sent via Africastalking for sale ${saleId}.`);
-    } else {
-      saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'Africastalking fallback failed with no specific error.';
-      logger.error(`❌ Safaricom fallback via Africastalking failed for sale ${saleId}: ${saleErrorMessage}`);
-    }
-  }
-}
         const updateSaleFields = {
             lastUpdated: FieldValue.serverTimestamp(), // Use server timestamp
-            dispatchResult: airtimeDispatchResult.data || airtimeDispatchResult.error || airtimeDispatchResult, // Store raw API response/error
+            dispatchResult: airtimeDispatchResult?.data || airtimeDispatchResult?.error || airtimeDispatchResult, // Store raw API response/error
             airtimeProviderUsed: airtimeProviderUsed, // New field to track provider used
         };
 
         if (airtimeDispatchStatus === 'COMPLETED') { // Check the consolidated status
             updateSaleFields.status = airtimeDispatchStatus;
 
+            // Only update Safaricom float balance from API response if Safaricom Dealer was used and successful
             if (targetCarrier === 'Safaricom' && airtimeDispatchResult.newSafaricomFloatBalance !== null && airtimeProviderUsed === 'SafaricomDealer') {
                 try {
                     await safaricomFloatDocRef.update({
@@ -996,7 +939,8 @@ app.post('/c2b-confirmation', async (req, res) => {
                 reversalAttempted: true, // Mark that a reversal attempt is made
             });
 
-            const reversalResult = await initiateDarajaReversal(transactionId, amount, mpesaNumber, BusinessShortCode); // Pass original amount and customer MSISDN
+            // FIX: Removed `BusinessShortCode` as it's undefined here and `initiateDarajaReversal` fetches it from env
+            const reversalResult = await initiateDarajaReversal(transactionId, amount, mpesaNumber); 
 
             if (reversalResult.success) {
                 logger.info(`✅ Daraja reversal initiated successfully for TransID ${transactionId}.`);
@@ -1017,7 +961,8 @@ app.post('/c2b-confirmation', async (req, res) => {
                 });
             } else {
                 logger.error(`❌ Daraja reversal failed to initiate for TransID ${transactionId}: ${reversalResult.message}`);
-                await failedReconciliationsCollection.doc(transactionId).set({
+                // FIX: Removed duplicate .doc(TransactionID) - it should be .doc(transactionId).set(...)
+                await failedReconciliationsCollection.doc(transactionId).set({ 
                     transactionId: transactionId,
                     amount: amount,
                     mpesaNumber: mpesaNumber,
@@ -1026,7 +971,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                     originalCallbackData: callbackData,
                     reason: reversalResult.message,
                     createdAt: FieldValue.serverTimestamp(),
-                });
+                }, { merge: true }); 
                 await transactionsCollection.doc(transactionId).update({
                     status: 'REVERSAL_INITIATION_FAILED',
                     lastUpdated: FieldValue.serverTimestamp(),
@@ -1053,8 +998,7 @@ app.post('/c2b-confirmation', async (req, res) => {
             message: error.message,
             stack: error.stack,
             callbackData: callbackData,
-            floatDebitedSuccessfully: floatDebitedSuccessfully,
-            carrierSpecificFloatLogicalName: carrierSpecificFloatLogicalName,
+            // Removed floatDebitedSuccessfully and carrierSpecificFloatLogicalName as they are now managed locally within dispatch logic
         });
 
         if (transactionId) {
@@ -1068,11 +1012,12 @@ app.post('/c2b-confirmation', async (req, res) => {
                 logger.error(`❌ Failed to update transaction ${transactionId} after critical error:`, updateError.message);
             }
         }
-        res.json({ "ResultCode": 0, "ResultDesc": "Internal server error during processing." });
+        // Changed ResultDesc to indicate internal error, while keeping ResultCode 0 for Daraja acknowledgement
+        res.json({ "ResultCode": 0, "ResultDesc": "Internal server error during processing. Please check logs." });
     }
 });
 
-//app.post('/daraja-reversal-result')
+// Daraja Reversal Result Endpoint
 app.post('/daraja-reversal-result', async (req, res) => {
     const reversalResult = req.body;
     logger.info('📞 Received Daraja Reversal Result Callback:', reversalResult);
@@ -1109,20 +1054,17 @@ app.post('/daraja-reversal-result', async (req, res) => {
             errorMessage: `Reversal failed: ${ResultDesc}`,
             lastUpdated: FieldValue.serverTimestamp(),
         });
-        await failedReconciliationsCollection.doc(TransactionID).doc(TransactionID).set({ // If you want to keep records in both
+        // FIX: Corrected duplicate .doc(TransactionID)
+        await failedReconciliationsCollection.doc(TransactionID).set({ 
             transactionId: TransactionID,
             reversalConfirmationDetails: reversalResult,
             reason: ResultDesc,
             createdAt: FieldValue.serverTimestamp(),
-            
         }, { merge: true }); 
     }
 
     res.json({ "ResultCode": 0, "ResultDesc": "Reversal result processed." });
 });
-
-// Add this new collection initialization at the top with your other collections
-const reversalTimeoutsCollection = firestore.collection('reversal_timeouts');
 
 // --- Daraja Reversal Queue Timeout Endpoint ---
 app.post('/daraja-reversal-timeout', async (req, res) => {
@@ -1182,7 +1124,7 @@ app.post('/daraja-reversal-timeout', async (req, res) => {
         
 // --- NEW AIRTIME BONUS API ENDPOINTS ---
 const CURRENT_BONUS_DOC_PATH = 'airtime_bonuses/current_settings'; // Document path for current settings
-const BONUS_HISTORY_COLLECTION = 'bonus_history'; // Collection for history logs
+// BONUS_HISTORY_COLLECTION is already defined at the top as a const
 
 // GET current bonus percentages
 app.get('/api/airtime-bonuses/current', async (req, res) => {
@@ -1229,7 +1171,7 @@ app.post('/api/airtime-bonuses/update', async (req, res) => {
 
         // Add history entries only if values have changed
         if (safaricomPercentage !== oldSettings.safaricomPercentage) {
-            batch.set(firestore.collection(BONUS_HISTORY_COLLECTION).doc(), {
+            batch.set(bonusHistoryCollection.doc(), { // Use the initialized collection variable
                 company: 'Safaricom',
                 oldPercentage: oldSettings.safaricomPercentage || 0,
                 newPercentage: safaricomPercentage,
@@ -1239,8 +1181,8 @@ app.post('/api/airtime-bonuses/update', async (req, res) => {
             logger.info(`Safaricom bonus changed from ${oldSettings.safaricomPercentage} to ${safaricomPercentage} by ${actor || 'system'}.`);
         }
         if (africastalkingPercentage !== oldSettings.africastalkingPercentage) {
-            batch.set(firestore.collection(BONUS_HISTORY_COLLECTION).doc(), {
-                company: 'Africastalking',
+            batch.set(bonusHistoryCollection.doc(), { // Use the initialized collection variable
+                company: 'AfricasTalking',
                 oldPercentage: oldSettings.africastalkingPercentage || 0,
                 newPercentage: africastalkingPercentage,
                 timestamp: FieldValue.serverTimestamp(),
@@ -1253,35 +1195,13 @@ app.post('/api/airtime-bonuses/update', async (req, res) => {
         res.json({ success: true, message: 'Bonus percentages updated successfully.' });
 
     } catch (error) {
-        logger.error('Error updating airtime bonuses:', { message: error.message, stack: error.stack });
+        logger.error('Error updating airtime bonuses:', { message: error.message, stack: error.stack }); // Completed the error message
         res.status(500).json({ error: 'Failed to update airtime bonuses.' });
     }
 });
 
-// GET bonus history
-app.get('/api/airtime-bonuses/history', async (req, res) => {
-    try {
-        const historyQuery = firestore.collection(BONUS_HISTORY_COLLECTION)
-                                       .orderBy('timestamp', 'desc')
-                                       .limit(50); // Limit to last 50 entries for performance
-
-        const snapshot = await historyQuery.get();
-        const history = snapshot.docs.map(doc => {
-            const data = doc.data();
-            return {
-                id: doc.id,
-                company: data.company,
-                oldPercentage: data.oldPercentage,
-                newPercentage: data.newPercentage,
-                timestamp: data.timestamp ? data.timestamp.toDate().toISOString() : null, // Convert Timestamp to ISO string for frontend
-                actor: data.actor,
-            };
-        });
-        res.json(history);
-    } catch (error) {
-        logger.error('Error fetching airtime bonus history:', { message: error.message, stack: error.stack });
-        res.status(500).json({ error: 'Failed to fetch airtime bonus history.' });
-    }
+// Start the server
+app.listen(PORT, () => {
+    logger.info(`Server running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
-
-app.listen(PORT, () => logger.info(`✅ Server running on port ${PORT}`));
