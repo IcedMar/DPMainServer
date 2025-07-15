@@ -509,7 +509,7 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
 }
 
 function generateSecurityCredential(password) {
-    const certificatePath = '/etc/secrets/safaricom_cert.cer';
+    const certificatePath = '/etc/secrets/ProductionCertificate.cer';
 
     try {
         console.log('🔹 Reading the public key certificate...');
