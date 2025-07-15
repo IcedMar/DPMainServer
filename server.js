@@ -748,30 +748,42 @@ app.post('/c2b-confirmation', async (req, res) => {
             return res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received, but airtime not dispatched due to unsupported carrier." });
         }
 
-        // --- FETCH BONUS SETTINGS AND CALCULATE FINAL AMOUNT TO DISPATCH ---
+       // --- FETCH BONUS SETTINGS AND CALCULATE FINAL AMOUNT TO DISPATCH ---
         const bonusDocRef = firestore.collection('airtime_bonuses').doc('current_settings');
         const bonusDocSnap = await bonusDocRef.get();
-        const bonusSettings = bonusDocSnap.exists ? bonusDocSnap.data() : { safaricomPercentage: 0, africastalkingPercentage: 0 };
 
-        let finalAmountToDispatch = amount; // Start with original amount
+        const safaricomBonus = bonusDocSnap?.data()?.safaricomPercentage ?? 0;
+        const atBonus = bonusDocSnap?.data()?.africastalkingPercentage ?? 0;
+
+        let finalAmountToDispatch = amount;
         let bonusApplied = 0;
 
-        if (targetCarrier === 'Safaricom') {
-            if (bonusSettings.safaricomPercentage > 0) {
-                bonusApplied = amount * (bonusSettings.safaricomPercentage / 100);
-                finalAmountToDispatch = amount + bonusApplied;
-                logger.info(`Applying ${bonusSettings.safaricomPercentage}% Safaricom bonus. Original: ${amount}, Bonus: ${bonusApplied}, Final: ${finalAmountToDispatch}`);
-            }
-        } else { // Airtel, Telkom, Equitel, Faiba via Africa's Talking
-            if (bonusSettings.africastalkingPercentage > 0) {
-                bonusApplied = amount * (bonusSettings.africastalkingPercentage / 100);
-                finalAmountToDispatch = amount + bonusApplied;
-                logger.info(`Applying ${bonusSettings.africastalkingPercentage}% AfricasTalking bonus. Original: ${amount}, Bonus: ${bonusApplied}, Final: ${finalAmountToDispatch}`);
-            }
+        // Custom rounding: 0.1-0.4 => 0, 0.5-0.9 => 1
+        const customRound = (value) => {
+            const decimalPart = value % 1;
+            const integerPart = Math.floor(value);
+            return decimalPart >= 0.5 ? integerPart + 1 : integerPart;
+        };
+
+        // Helper to apply bonus
+        const applyBonus = (percentage, label) => {
+            const rawBonus = amount * (percentage / 100);
+            const roundedBonus = customRound(rawBonus);
+            const total = amount + roundedBonus;
+            logger.info(`Applying ${percentage}% ${label} bonus. Original: ${amount}, Bonus: ${roundedBonus}, Final: ${total}`);
+            return { total, roundedBonus };
+        };
+
+        if (targetCarrier === 'Safaricom' && safaricomBonus > 0) {
+            const result = applyBonus(safaricomBonus, 'Safaricom');
+            finalAmountToDispatch = result.total;
+            bonusApplied = result.roundedBonus;
+        } else if (['Airtel', 'Telkom', 'Equitel', 'Faiba'].includes(targetCarrier) && atBonus > 0) {
+            const result = applyBonus(atBonus, 'AfricasTalking');
+            finalAmountToDispatch = result.total;
+            bonusApplied = result.roundedBonus;
         }
-        // Round to 2 decimal places for financial accuracy
-        finalAmountToDispatch = parseFloat(finalAmountToDispatch.toFixed(2));
-        bonusApplied = parseFloat(bonusApplied.toFixed(2));
+
 
         // Initialize sale document early
         const saleRef = salesCollection.doc();
