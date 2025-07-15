@@ -680,7 +680,7 @@ app.post('/c2b-validation', async (req, res) => {
 
         // ✅ Fetch settings from Firestore in parallel
         const [carrierDoc, systemDoc] = await Promise.all([
-            firestore.collection('carrier_settings').doc(carrier).get(),
+            firestore.collection('carrier_settings').doc(carrier.toLowerCase()).get(),
             firestore.collection('system_settings').doc('global').get(),
         ]);
 
