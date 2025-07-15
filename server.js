@@ -673,18 +673,8 @@ app.post('/c2b-validation', async (req, res) => {
     const transactionIdentifier = callbackData.TransID || `C2B_VALIDATION_${Date.now()}`;
     const { TransAmount, BillRefNumber } = callbackData;
     const amount = parseFloat(TransAmount);
-    const MIN_AMOUNT = 5.0;
 
     try {
-        // ✅ Validate amount
-        if (isNaN(amount) || amount < MIN_AMOUNT) {
-            throw {
-                code: 'C2B00013',
-                desc: `Invalid amount: must be at least KES ${MIN_AMOUNT}`,
-                subType: 'INVALID_AMOUNT_TOO_LOW'
-            };
-        }
-
         // ✅ Validate phone format
         const phoneRegex = /^(\+254|254|0)(1|7)\d{8}$/;
         if (!phoneRegex.test(BillRefNumber)) {
@@ -779,6 +769,13 @@ app.post('/c2b-confirmation', async (req, res) => {
         MiddleName,
         LastName,
     } = callbackData;
+
+    const MIN_AMOUNT = 5.0;
+    const MAX_AMOUNT = 5000.0;
+    if (TransAmount < MIN_AMOUNT || TransAmount > MAX_AMOUNT) {
+        await initiateDarajaReversal(transactionId, TransAmount, 'l');
+        return ;
+    }
 
     const topupNumber = BillRefNumber.replace(/\D/g, '');
     const amount = parseFloat(TransAmount); // This is the original amount paid by customer
