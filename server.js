@@ -639,41 +639,158 @@ async function updateCarrierFloatBalance(carrierLogicalName, amount) {
 
 // --- C2B (Offline Paybill) Callbacks ---
 
+//AT Status Validation Callback
+app.post('/AT_status_callback', async (req, res) => {
+  const {
+    phoneNumber,
+    status,
+    description,
+    requestId,
+    discount,
+    value
+  } = req.body;
+
+  try {
+    if (!requestId || !phoneNumber || !status) {
+      return res.status(400).json({ message: 'Missing required fields' });
+    }
+
+    // Step 1: Lookup saleId from requestId
+    const docSnap = await firestore.collection('pending_airtime_callbacks').doc(requestId).get();
+
+    if (!docSnap.exists) {
+      console.warn(`⚠️ No matching sale found for AT requestId: ${requestId}`);
+      return res.status(404).json({ message: 'Sale not found for this requestId' });
+    }
+
+    const { saleId } = docSnap.data();
+
+    // Step 2: Update sale status
+    const saleUpdate = {
+      status: status === 'Success' ? 'COMPLETED' : 'FAILED',
+      dispatchCallback: {
+        phoneNumber,
+        status,
+        description,
+        discount,
+        value,
+        receivedAt: FieldValue.serverTimestamp(),
+      },
+      lastUpdated: FieldValue.serverTimestamp(),
+    };
+
+    await firestore.collection('sales').doc(saleId).update(saleUpdate);
+
+    // Step 3: Optionally remove from pending
+    await firestore.collection('pending_airtime_callbacks').doc(requestId).delete();
+
+    return res.status(200).json({ message: 'Callback processed successfully' });
+
+  } catch (err) {
+    console.error(`❌ Error processing AT status callback:`, err);
+    return res.status(500).json({ message: 'Internal Server Error' });
+  }
+});
+
+
+
 // C2B Validation Endpoint
 app.post('/c2b-validation', async (req, res) => {
     const callbackData = req.body;
     const now = new Date();
     const transactionIdentifier = callbackData.TransID || `C2B_VALIDATION_${Date.now()}`;
-
-    logger.info('📞 Received C2B Validation Callback:', { TransID: transactionIdentifier, callback: callbackData });
-
-    const { TransAmount } = callbackData;
+    const { TransAmount, BillRefNumber } = callbackData;
     const amount = parseFloat(TransAmount);
-    const MIN_AMOUNT = 5.00;
+    const MIN_AMOUNT = 5.0;
 
-    // --- Validation Check: Amount KES 10 and above ---
-    if (isNaN(amount) || amount < MIN_AMOUNT) {
-        logger.warn(`⚠️ C2B Validation rejected [TransID: ${transactionIdentifier}]: Invalid amount (${TransAmount}). Must be KES ${MIN_AMOUNT} or more.`);
-        await errorsCollection.add({
-            type: 'C2B_VALIDATION_REJECT',
-            subType: 'INVALID_AMOUNT_TOO_LOW',
-            error: `Transaction amount must be KES ${MIN_AMOUNT} or more: ${TransAmount}`,
-            callbackData: callbackData,
-            createdAt: now,
+    try {
+        // ✅ Validate amount
+        if (isNaN(amount) || amount < MIN_AMOUNT) {
+            throw {
+                code: 'C2B00013',
+                desc: `Invalid amount: must be at least KES ${MIN_AMOUNT}`,
+                subType: 'INVALID_AMOUNT_TOO_LOW'
+            };
+        }
+
+        // ✅ Validate phone format
+        const phoneRegex = /^(\+254|254|0)(1|7)\d{8}$/;
+        if (!phoneRegex.test(BillRefNumber)) {
+            throw {
+                code: 'C2B00012',
+                desc: `Invalid BillRefNumber format: ${BillRefNumber}`,
+                subType: 'INVALID_BILL_REF'
+            };
+        }
+
+        // ✅ Detect carrier
+        const carrier = detectCarrier(BillRefNumber);
+        if (carrier === 'Unknown') {
+            throw {
+                code: 'C2B00011',
+                desc: `Could not detect carrier from BillRefNumber: ${BillRefNumber}`,
+                subType: 'CARRIER_UNKNOWN'
+            };
+        }
+
+        // ✅ Fetch settings from Firestore in parallel
+        const [carrierDoc, systemDoc] = await Promise.all([
+            firestore.collection('carrier_settings').doc(carrier).get(),
+            firestore.collection('system_settings').doc('global').get(),
+        ]);
+
+        // ✅ Check system status
+        const systemStatus = systemDoc.exists ? systemDoc.data().status : 'offline';
+        if (systemStatus !== 'online') {
+            throw {
+                code: 'C2B00016',
+                desc: `System is currently offline.`,
+                subType: 'SYSTEM_OFFLINE'
+            };
+        }
+
+        // ✅ Check if carrier is active
+        const carrierActive = carrierDoc.exists ? carrierDoc.data().active : false;
+        if (!carrierActive) {
+            throw {
+                code: 'C2B00011',
+                desc: `${carrier} is currently inactive`,
+                subType: 'CARRIER_INACTIVE'
+            };
+        }
+
+        // ✅ Passed all checks
+        console.info('✅ C2B Validation successful:', {
+            TransID: transactionIdentifier,
+            Amount: TransAmount,
+            Carrier: carrier,
+            Phone: BillRefNumber,
         });
+
         return res.json({
-            "ResultCode": "CB00013",
-            "ResultDesc": "Rejected",
+            ResultCode: '0',
+            ResultDesc: 'Accepted',
+        });
+
+    } catch (err) {
+        console.warn(`❌ Validation failed [${transactionIdentifier}]: ${err.desc}`, { error: err });
+
+        await firestore.collection('errors').add({
+            type: 'C2B_VALIDATION_REJECT',
+            subType: err.subType || 'UNKNOWN_ERROR',
+            error: err.desc || JSON.stringify(err),
+            callbackData,
+            createdAt: FieldValue.serverTimestamp(),
+        });
+
+        return res.json({
+            ResultCode: err.code || 'C2B00016',
+            ResultDesc: 'Rejected',
         });
     }
-
-    // If only amount validation is needed and passed
-    logger.info('✅ C2B Validation successful (amount check only):', { TransID: transactionIdentifier, Amount: TransAmount });
-    res.json({
-        "ResultCode": 0, // Accept
-        "ResultDesc": "Accepted"
-    });
 });
+
+
 
 // C2B Confirmation Endpoint (Mandatory)
 app.post('/c2b-confirmation', async (req, res) => {
@@ -748,7 +865,7 @@ app.post('/c2b-confirmation', async (req, res) => {
             return res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received, but airtime not dispatched due to unsupported carrier." });
         }
 
-       // --- FETCH BONUS SETTINGS AND CALCULATE FINAL AMOUNT TO DISPATCH ---
+         // --- FETCH BONUS SETTINGS AND CALCULATE FINAL AMOUNT TO DISPATCH ---
         const bonusDocRef = firestore.collection('airtime_bonuses').doc('current_settings');
         const bonusDocSnap = await bonusDocRef.get();
 
@@ -773,16 +890,6 @@ app.post('/c2b-confirmation', async (req, res) => {
             logger.info(`Applying ${percentage}% ${label} bonus. Original: ${amount}, Bonus: ${roundedBonus}, Final: ${total}`);
             return { total, roundedBonus };
         };
-
-        if (targetCarrier === 'Safaricom' && safaricomBonus > 0) {
-            const result = applyBonus(safaricomBonus, 'Safaricom');
-            finalAmountToDispatch = result.total;
-            bonusApplied = result.roundedBonus;
-        } else if (['Airtel', 'Telkom', 'Equitel', 'Faiba'].includes(targetCarrier) && atBonus > 0) {
-            const result = applyBonus(atBonus, 'AfricasTalking');
-            finalAmountToDispatch = result.total;
-            bonusApplied = result.roundedBonus;
-        }
 
 
         // Initialize sale document early
@@ -816,58 +923,100 @@ app.post('/c2b-confirmation', async (req, res) => {
                     airtimeDispatchStatus = 'COMPLETED';
                     logger.info(`✅ Safaricom airtime successfully sent via Dealer Portal for sale ${saleId}.`);
                 } else {
-                    saleErrorMessage = airtimeDispatchResult?.error || 'Safaricom Dealer Portal failed with unknown error.';
-                    logger.warn(`⚠️ Safaricom Dealer Portal failed for TransID ${transactionId}. Attempting fallback to Africastalking. Error: ${saleErrorMessage}`);
+    saleErrorMessage = airtimeDispatchResult?.error || 'Safaricom Dealer Portal failed with unknown error.';
+    logger.warn(`⚠️ Safaricom Dealer Portal failed for TransID ${transactionId}. Attempting fallback to Africastalking. Error: ${saleErrorMessage}`);
 
-                    // Refund Safaricom float, as primary attempt failed
-                    await updateCarrierFloatBalance('safaricomFloat', finalAmountToDispatch);
-                    logger.info(`✅ Refunded Safaricom float for TransID ${transactionId}: +${finalAmountToDispatch}`);
+    // Refund Safaricom float
+    await updateCarrierFloatBalance('safaricomFloat', finalAmountToDispatch);
+    logger.info(`✅ Refunded Safaricom float for TransID ${transactionId}: +${finalAmountToDispatch}`);
 
-                    // Attempt fallback via Africa's Talking (debit AT float)
-                    await updateCarrierFloatBalance('africasTalkingFloat', -finalAmountToDispatch); 
-                    airtimeProviderUsed = 'AfricasTalkingFallback';
-                    airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
+    // Attempt fallback via Africa's Talking (debit AT float)
+    await updateCarrierFloatBalance('africasTalkingFloat', -finalAmountToDispatch); 
+    airtimeProviderUsed = 'AfricasTalkingFallback';
 
-                    if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
-                        airtimeDispatchStatus = 'COMPLETED';
-                        logger.info(`✅ Safaricom fallback airtime successfully sent via Africastalking for sale ${saleId}.`);
-                        // NEW: Adjust Africa's Talking float for 4% commission
-                        const commissionAmount = parseFloat((amount * 0.04).toFixed(2));
-                        await updateCarrierFloatBalance('africasTalkingFloat', commissionAmount);
-                        logger.info(`✅ Credited Africa's Talking float with ${commissionAmount} (4% commission) for TransID ${transactionId}.`);
-                    } else {
-                        saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'Africastalking fallback failed with no specific error.';
-                        logger.error(`❌ Safaricom fallback via Africastalking failed for sale ${saleId}: ${saleErrorMessage}`);
-                    }
-                }
+    airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
+
+    const requestId = airtimeDispatchResult?.requestId || `AT_${Date.now()}_${saleId}`;
+    airtimeDispatchStatus = 'INITIATED';
+
+    if (airtimeDispatchResult) {
+        logger.info(`✅ Fallback airtime dispatch INITIATED via Africastalking for sale ${saleId}. RequestID: ${requestId}`);
+
+        // 1. Update sale to INITIATED
+        await saleRef.update({
+            status: 'INITIATED',
+            airtimeProviderUsed,
+            dispatchResult: airtimeDispatchResult,
+            lastUpdated: FieldValue.serverTimestamp(),
+        });
+
+        // 2. Track pending callback
+        await firestore.collection('pending_airtime_callbacks').doc(requestId).set({
+            saleId,
+            transactionId,
+            phoneNumber: topupNumber,
+            carrier: targetCarrier,
+            requestId,
+            amount: finalAmountToDispatch,
+            status: 'INITIATED',
+            fallbackFrom: 'SafaricomDealer',
+            createdAt: FieldValue.serverTimestamp(),
+        });
+
+    } else {
+        // AT didn't return anything useful
+        saleErrorMessage = 'Africastalking fallback failed with no specific error.';
+        airtimeDispatchStatus = 'FAILED';
+        logger.error(`❌ Safaricom fallback via Africastalking failed for sale ${saleId}: ${saleErrorMessage}`);
+    }
+}
+
             } catch (dispatchError) {
                 saleErrorMessage = `Safaricom primary dispatch process failed (or float debit failed): ${dispatchError.message}`;
                 logger.error(`❌ Safaricom primary dispatch process failed for TransID ${transactionId}: ${dispatchError.message}`);
             }
 
         } else if (['Airtel', 'Telkom', 'Equitel', 'Faiba'].includes(targetCarrier)) {
-            // Directly dispatch via Africa's Talking
-            try {
-                await updateCarrierFloatBalance('africasTalkingFloat', -finalAmountToDispatch);
-                airtimeProviderUsed = 'AfricasTalkingDirect';
-                airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
+       try {
+        await updateCarrierFloatBalance('africasTalkingFloat', -finalAmountToDispatch);
+        airtimeProviderUsed = 'AfricasTalkingDirect';
+        
+        airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
 
-                if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
-                    airtimeDispatchStatus = 'COMPLETED';
-                    logger.info(`✅ AfricasTalking airtime successfully sent directly for sale ${saleId}.`);
-                    // NEW: Adjust Africa's Talking float for 4% commission
-                    const commissionAmount = parseFloat((amount * 0.04).toFixed(2));
-                    await updateCarrierFloatBalance('africasTalkingFloat', commissionAmount);
-                    logger.info(`✅ Credited Africa's Talking float with ${commissionAmount} (4% commission) for TransID ${transactionId}.`);
-                } else {
-                    saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.Safaricom : 'Africastalking direct dispatch failed with no specific error.';
-                    logger.error(`❌ AfricasTalking direct dispatch failed for sale ${saleId}: ${saleErrorMessage}`);
-                }
-            } catch (dispatchError) {
-                saleErrorMessage = `AfricasTalking direct dispatch process failed (or float debit failed): ${dispatchError.message}`;
-                logger.error(`❌ AfricasTalking direct dispatch process failed for TransID ${transactionId}: ${dispatchError.message}`);
-            }
-        } else {
+        // Extract requestId if available
+        const requestId = airtimeDispatchResult?.requestId || `AT_${Date.now()}_${saleId}`;
+
+        airtimeDispatchStatus = 'INITIATED'; // Now using INITIATED, will update on callback
+
+        logger.info(`✅ Airtime dispatch INITIATED via AfricasTalking for sale ${saleId}. RequestID: ${requestId}`);
+
+        // 1. Update sale document
+        await saleRef.update({
+            status: 'INITIATED',
+            airtimeProviderUsed,
+            dispatchResult: airtimeDispatchResult,
+            lastUpdated: FieldValue.serverTimestamp(),
+        });
+
+        // 2. Save in pending callbacks for later tracking
+        await firestore.collection('pending_airtime_callbacks').doc(requestId).set({
+            saleId,
+            transactionId,
+            phoneNumber: topupNumber,
+            carrier: targetCarrier,
+            requestId,
+            amount: finalAmountToDispatch,
+            status: 'INITIATED',
+            createdAt: FieldValue.serverTimestamp(),
+        });
+
+    } catch (dispatchError) {
+        saleErrorMessage = `AfricasTalking direct dispatch process failed (or float debit failed): ${dispatchError.message}`;
+        airtimeDispatchStatus = 'FAILED';
+        logger.error(`❌ AfricasTalking direct dispatch failed for TransID ${transactionId}: ${dispatchError.message}`);
+    }
+}
+else {
             // This case should ideally be caught by the initial detectCarrier check, but good for robustness
             saleErrorMessage = `No valid dispatch path for carrier: ${targetCarrier}`;
             logger.error(`❌ ${saleErrorMessage} for TransID ${transactionId}`);
