@@ -831,13 +831,13 @@ app.post('/c2b-confirmation', async (req, res) => {
             const roundedBonus = customRound(rawBonus);
             const total = amount + roundedBonus;
             logger.info(`Applying ${percentage}% ${label} bonus. Original: ${amount}, Bonus: ${roundedBonus}, Final: ${total}`);
-            return { total, roundedBonus };
+            return { total, roundedBonus, rawBonus };
         };
 
         if (targetCarrier === 'Safaricom' && safaricomBonus > 0) {
             const result = applyBonus(safaricomBonus, 'Safaricom');
             finalAmountToDispatch = result.total;
-            bonusApplied = result.roundedBonus;
+            bonusApplied = result.rawBonus;
         } else if (['Airtel', 'Telkom', 'Equitel', 'Faiba'].includes(targetCarrier) && atBonus > 0) {
             const result = applyBonus(atBonus, 'AfricasTalking');
             finalAmountToDispatch = result.total;
