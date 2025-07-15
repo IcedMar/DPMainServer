@@ -561,7 +561,7 @@ async function initiateDarajaReversal(transactionId, amount, receiverMsisdn) { /
             Amount: amount, // The amount to reverse
             ReceiverParty: shortCode, // Your Short Code
             RecieverIdentifierType: "11",
-            QueueTimeoutURL: process.env.MPESA_REVERSAL_QUEUE_TIMEOUT_URL, // URL for timeout callbacks
+            QueueTimeOutURL: process.env.MPESA_REVERSAL_QUEUE_TIMEOUT_URL, // URL for timeout callbacks
             ResultURL: process.env.MPESA_REVERSAL_RESULT_URL, // URL for result callbacks
             Remarks: `Airtime dispatch failed for ${transactionId}`,
             Occasion: "Failed Airtime Topup"
@@ -1290,7 +1290,7 @@ app.post('/api/trigger-daraja-reversal', async (req, res) =>{
             Amount: amount, // The amount to reverse
             ReceiverParty: shortCode, 
             RecieverIdentifierType: "11",
-            QueueTimeoutURL: process.env.MPESA_REVERSAL_QUEUE_TIMEOUT_URL, // URL for timeout callbacks
+            QueueTimeOutURL: process.env.MPESA_REVERSAL_QUEUE_TIMEOUT_URL, // URL for timeout callbacks
             ResultURL: process.env.MPESA_REVERSAL_RESULT_URL, // URL for result callbacks
             Remarks: `Airtime dispatch failed for ${transactionId}`,
             Occasion: "Failed Airtime Topup"
