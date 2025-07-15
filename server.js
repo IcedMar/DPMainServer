@@ -1260,6 +1260,84 @@ app.get('/api/airtime-bonuses/current', async (req, res) => {
     }
 });
 
+app.post('/api/trigger-daraja-reversal', async (req, res) =>{
+    // Removed shortCode parameter as it's fetched from env
+    const {transactionId, mpesaNumber, amount} = req.body;
+    logger.info(`🔄 Attempting Daraja reversal for TransID: ${transactionId}, Amount: ${amount}`);
+    try {
+        const accessToken = await getDarajaAccessToken(); // Function to get Daraja access token
+
+        if (!accessToken) {
+            throw new Error("Failed to get Daraja access token for reversal.");
+        }
+
+        const url = process.env.MPESA_REVERSAL_URL; 
+        const shortCode = process.env.MPESA_SHORTCODE; 
+        const initiator = process.env.MPESA_INITIATOR_NAME; 
+        const password=process.env.MPESA_SECURITY_PASSWORD;
+        const securityCredential = generateSecurityCredential(password);  
+        
+
+        if (!url || !shortCode || !initiator || !securityCredential) {
+            throw new Error("Missing Daraja reversal environment variables.");
+        }
+
+        const payload = {
+            Initiator: initiator,
+            SecurityCredential: securityCredential, // Use your actual security credential
+            CommandID: "TransactionReversal",
+            TransactionID: transactionId, // The M-Pesa TransID to be reversed
+            Amount: amount, // The amount to reverse
+            ReceiverPartyA: shortCode, // Your Short Code
+            ReceiverPartyB: mpesaNumber, // The customer's MSISDN
+            QueueTimeoutURL: process.env.MPESA_REVERSAL_QUEUE_TIMEOUT_URL, // URL for timeout callbacks
+            ResultURL: process.env.MPESA_REVERSAL_RESULT_URL, // URL for result callbacks
+            Remarks: `Airtime dispatch failed for ${transactionId}`,
+            Occasion: "Failed Airtime Topup"
+        };
+
+        const headers = {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${accessToken}`
+        };
+
+        const response = await axios.post(url, payload, { headers });
+
+        logger.info(`✅ Daraja Reversal API response for TransID ${transactionId}:`, response.data);
+        if (response.data && response.data.ResponseCode === '0') {
+            return {
+                success: true,
+                message: "Reversal request accepted by Daraja.",
+                data: response.data,
+                // You might store the ConversationID for tracking if provided
+                conversationId: response.data.ConversationID || null,
+            };
+        } else {
+            const errorMessage = response.data ?
+                `Daraja reversal request failed: ${response.data.ResponseDescription || 'Unknown error'}` :
+                'Daraja reversal request failed with no response data.';
+            logger.error(`❌ Daraja reversal request not accepted for TransID ${transactionId}: ${errorMessage}`);
+            return {
+                success: false,
+                message: errorMessage,
+                data: response.data,
+            };
+        }
+
+    } catch (error) {
+        const errorData = error.response ? error.response.data : error.message;
+        logger.error(`❌ Exception during Daraja reversal for TransID ${transactionId}:`, {
+            error: errorData,
+            stack: error.stack
+        });
+        return {
+            success: false,
+            message: `Exception in reversal process: ${errorData.errorMessage || error.message}`,
+            error: errorData
+        };
+    }
+})
+
 // POST to update bonus percentages and log history
 app.post('/api/airtime-bonuses/update', async (req, res) => {
     const { safaricomPercentage, africastalkingPercentage, actor } = req.body; // 'actor' could be the authenticated user's ID/email
