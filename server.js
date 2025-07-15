@@ -449,7 +449,7 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
         };
     }
 
-    if (!process.env.AT_API_KEY || !process.env.AT_USERNAME) {
+    if (!process.env.API_KEY || !process.env.USERNAME) {
         logger.error('Missing Africa\'s Talking API environment variables.');
         return { status: 'FAILED', message: 'Missing Africa\'s Talking credentials.' };
     }
@@ -467,12 +467,14 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
         const response = result?.responses?.[0];
         const status = response?.status;
         const errorMessage = response?.errorMessage;
+        const atRequestId = response?.requestId;
 
         if (status === 'Sent' && errorMessage === 'None') {
             logger.info(`✅ Africa's Talking airtime successfully sent to ${carrier}:`, {
                 recipient: normalizedPhone,
                 amount: amount,
-                at_response: result
+                response: result,
+                at_requestId: atRequestId
             });
             return {
                 status: 'SUCCESS',
@@ -483,7 +485,7 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
             logger.error(`❌ Africa's Talking airtime send indicates non-success for ${carrier}:`, {
                 recipient: normalizedPhone,
                 amount: amount,
-                at_response: result
+                response: result
             });
             return {
                 status: 'FAILED',
@@ -649,6 +651,7 @@ app.post('/AT_status_callback', async (req, res) => {
     discount,
     value
   } = req.body;
+log.console("Response:", body);
 
   try {
     if (!requestId || !phoneNumber || !status) {
