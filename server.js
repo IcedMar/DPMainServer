@@ -3,6 +3,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const crypto = require('crypto');
+const fs = require('fs')
 const { Firestore, FieldValue } = require('@google-cloud/firestore'); // Import FieldValue
 const cors = require('cors');
 const helmet = require('helmet');
@@ -507,6 +508,30 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
     }
 }
 
+function generateSecurityCredential(password) {
+    const certificatePath = '/etc/secrets/safaricom_cert.cer';
+
+    try {
+        console.log('🔹 Reading the public key certificate...');
+        const publicKey = fs.readFileSync(certificatePath, 'utf8');
+
+        console.log('✅ Certificate loaded successfully.');
+        console.log('🔹 Encrypting the password...');
+        const encryptedBuffer = crypto.publicEncrypt(
+            {
+                key: publicKey,
+                padding: crypto.constants.RSA_PKCS1_PADDING,
+            },
+            Buffer.from(password, 'utf8')
+        );
+
+        return encryptedBuffer.toString('base64');
+    } catch (error) {
+        console.error('❌ Error generating security credential:', error.message);
+        return null;
+    }
+}
+
 // --- NEW: Daraja Reversal Function ---
 async function initiateDarajaReversal(transactionId, amount, receiverMsisdn) { // Removed shortCode parameter as it's fetched from env
     logger.info(`🔄 Attempting Daraja reversal for TransID: ${transactionId}, Amount: ${amount}`);
@@ -517,10 +542,12 @@ async function initiateDarajaReversal(transactionId, amount, receiverMsisdn) { /
             throw new Error("Failed to get Daraja access token for reversal.");
         }
 
-        const url = process.env.MPESA_REVERSAL_URL; // e.g., 'https://api.safaricom.co.ke/mpesa/reversal/v1/request'
-        const shortCode = process.env.MPESA_SHORTCODE; // Your M-Pesa Short Code / Paybill number
-        const initiator = process.env.MPESA_INITIATOR_NAME; // The Initiator Name (Business name)
-        const securityCredential = process.env.MPESA_SECURITY_CREDENTIAL; // Encrypted password (usually from a secure source)
+        const url = process.env.MPESA_REVERSAL_URL; 
+        const shortCode = process.env.MPESA_SHORTCODE; 
+        const initiator = process.env.MPESA_INITIATOR_NAME; 
+        const password=process.env.MPESA_SECURITY_PASSWORD;
+        const securityCredential = generateSecurityCredential(password);  
+        
 
         if (!url || !shortCode || !initiator || !securityCredential) {
             throw new Error("Missing Daraja reversal environment variables.");
