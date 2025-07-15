@@ -559,8 +559,7 @@ async function initiateDarajaReversal(transactionId, amount, receiverMsisdn) { /
             CommandID: "TransactionReversal",
             TransactionID: transactionId, // The M-Pesa TransID to be reversed
             Amount: amount, // The amount to reverse
-            ReceiverPartyA: shortCode, // Your Short Code
-            ReceiverPartyB: receiverMsisdn, // The customer's MSISDN
+            ReceiverParty: shortCode, // Your Short Code
             RecieverIdentifierType: "11",
             QueueTimeoutURL: process.env.MPESA_REVERSAL_QUEUE_TIMEOUT_URL, // URL for timeout callbacks
             ResultURL: process.env.MPESA_REVERSAL_RESULT_URL, // URL for result callbacks
@@ -1289,8 +1288,7 @@ app.post('/api/trigger-daraja-reversal', async (req, res) =>{
             CommandID: "TransactionReversal",
             TransactionID: transactionId, // The M-Pesa TransID to be reversed
             Amount: amount, // The amount to reverse
-            ReceiverPartyA: shortCode, // Your Short Code
-            ReceiverPartyB: mpesaNumber, // The customer's MSISDN
+            ReceiverParty: shortCode, 
             RecieverIdentifierType: "11",
             QueueTimeoutURL: process.env.MPESA_REVERSAL_QUEUE_TIMEOUT_URL, // URL for timeout callbacks
             ResultURL: process.env.MPESA_REVERSAL_RESULT_URL, // URL for result callbacks
