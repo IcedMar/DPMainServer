@@ -533,7 +533,7 @@ function generateSecurityCredential(password) {
 }
 
 // --- NEW: Daraja Reversal Function ---
-async function initiateDarajaReversal(transactionId, amount, receiverMsisdn) { // Removed shortCode parameter as it's fetched from env
+async function initiateDarajaReversal(transactionId, amount, receiverMsisdn) { 
     logger.info(`🔄 Attempting Daraja reversal for TransID: ${transactionId}, Amount: ${amount}`);
     try {
         const accessToken = await getDarajaAccessToken(); // Function to get Daraja access token
@@ -770,12 +770,23 @@ app.post('/c2b-confirmation', async (req, res) => {
         LastName,
     } = callbackData;
 
-    const MIN_AMOUNT = 5.0;
-    const MAX_AMOUNT = 5000.0;
-    if (TransAmount < MIN_AMOUNT || TransAmount > MAX_AMOUNT) {
-        await initiateDarajaReversal(transactionId, TransAmount, 'l');
-        return ;
+    const MIN_AMOUNT = 5;
+    const MAX_AMOUNT = 5000;
+
+// Convert amount to full integer
+const amountInt = Math.round(parseFloat(TransAmount));
+
+if (amountInt < MIN_AMOUNT || amountInt > MAX_AMOUNT) {
+    logger.warn(`🛑 Transaction amount ${amountInt} is outside allowed range (${MIN_AMOUNT} - ${MAX_AMOUNT}). Initiating reversal.`);
+    const reversalResult = await initiateDarajaReversal(transactionId, amountInt, mpesaNumber); 
+    if (reversalResult.success) {
+        logger.info(`✅ Reversal initiated for invalid amount ${amountInt} on transaction ${transactionId}`);
+    } else {
+        logger.error(`❌ Reversal failed for invalid amount ${amountInt}: ${reversalResult.message}`);
     }
+    return; // Stop further processing
+}
+
 
     const topupNumber = BillRefNumber.replace(/\D/g, '');
     const amount = parseFloat(TransAmount); // This is the original amount paid by customer
@@ -1131,51 +1142,77 @@ app.post('/c2b-confirmation', async (req, res) => {
 
 // Daraja Reversal Result Endpoint
 app.post('/daraja-reversal-result', async (req, res) => {
-    const reversalResult = req.body;
-    logger.info('📞 Received Daraja Reversal Result Callback:', reversalResult);
+    try {
+        const result = req.body?.Result;
+        logger.info('📞 Received Daraja Reversal Result Callback:', result);
 
-    const { TransactionID, ResultCode, ResultDesc } = reversalResult; // From Daraja's response structure
+        const resultCode = result?.ResultCode;
+        const resultDesc = result?.ResultDesc;
+        const reversalTransactionId = result?.TransactionID;
 
-    // Get the original transaction document
-    const transactionRef = transactionsCollection.doc(TransactionID);
-    const transactionDoc = await transactionRef.get();
+        const params = result?.ResultParameters?.ResultParameter || [];
 
-    if (!transactionDoc.exists) {
-        logger.warn(`⚠️ Reversal result received for unknown TransID: ${TransactionID}`);
-        return res.json({ "ResultCode": 0, "ResultDesc": "Acknowledged" });
+        // Extract parameters safely
+        const extractParam = (key) => params.find(p => p.Key === key)?.Value;
+
+        const originalTransactionId = extractParam('OriginalTransactionID');
+        const amount = extractParam('Amount');
+        const creditParty = extractParam('CreditPartyPublicName');
+        const debitParty = extractParam('DebitPartyPublicName');
+
+        if (!originalTransactionId) {
+            logger.error("❌ Missing OriginalTransactionID in reversal callback", { rawCallback: req.body });
+            return res.status(400).json({ ResultCode: 0, ResultDesc: "Missing OriginalTransactionID. Logged for manual review." });
+        }
+
+        const transactionRef = transactionsCollection.doc(originalTransactionId);
+        const transactionDoc = await transactionRef.get();
+
+        if (!transactionDoc.exists) {
+            logger.warn(`⚠️ Reversal result received for unknown OriginalTransactionID: ${originalTransactionId}`);
+            return res.json({ ResultCode: 0, ResultDesc: "Acknowledged - Unknown transaction." });
+        }
+
+        if (resultCode === 0) {
+            logger.info(`✅ Reversal for TransID ${originalTransactionId} COMPLETED successfully.`);
+            await transactionRef.update({
+                status: 'REVERSED_SUCCESSFULLY',
+                reversalConfirmationDetails: result,
+                lastUpdated: FieldValue.serverTimestamp(),
+            });
+            await reconciledTransactionsCollection.doc(originalTransactionId).update({
+                status: 'REVERSAL_CONFIRMED',
+                reversalConfirmationDetails: result,
+                lastUpdated: FieldValue.serverTimestamp(),
+            });
+        } else {
+            logger.error(`❌ Reversal for TransID ${originalTransactionId} FAILED: ${resultDesc}`);
+            await transactionRef.update({
+                status: 'REVERSAL_FAILED_CONFIRMATION',
+                reversalConfirmationDetails: result,
+                errorMessage: `Reversal failed: ${resultDesc}`,
+                lastUpdated: FieldValue.serverTimestamp(),
+            });
+            await failedReconciliationsCollection.doc(originalTransactionId).set({
+                transactionId: originalTransactionId,
+                reversalConfirmationDetails: result,
+                reason: resultDesc,
+                createdAt: FieldValue.serverTimestamp(),
+            }, { merge: true });
+        }
+
+        res.json({ ResultCode: 0, ResultDesc: "Reversal result processed successfully." });
+
+    } catch (error) {
+        logger.error("❌ Error processing Daraja reversal callback", {
+            message: error.message,
+            stack: error.stack,
+            rawBody: req.body,
+        });
+        res.status(500).json({ ResultCode: 0, ResultDesc: "Server error during reversal processing." });
     }
-
-    // Update the transaction status based on reversal result
-    if (ResultCode === '0') { // Check Daraja's success code for actual reversal completion
-        logger.info(`✅ Reversal for TransID ${TransactionID} COMPLETED successfully.`);
-        await transactionRef.update({
-            status: 'REVERSED_SUCCESSFULLY',
-            reversalConfirmationDetails: reversalResult,
-            lastUpdated: FieldValue.serverTimestamp(),
-        });
-        await reconciledTransactionsCollection.doc(TransactionID).update({
-            status: 'REVERSAL_CONFIRMED',
-            reversalConfirmationDetails: reversalResult,
-            lastUpdated: FieldValue.serverTimestamp(),
-        });
-    } else {
-        logger.error(`❌ Reversal for TransID ${TransactionID} FAILED: ${ResultDesc}`);
-        await transactionRef.update({
-            status: 'REVERSAL_FAILED_CONFIRMATION',
-            reversalConfirmationDetails: reversalResult,
-            errorMessage: `Reversal failed: ${ResultDesc}`,
-            lastUpdated: FieldValue.serverTimestamp(),
-        });
-        await failedReconciliationsCollection.doc(TransactionID).set({ 
-            transactionId: TransactionID,
-            reversalConfirmationDetails: reversalResult,
-            reason: ResultDesc,
-            createdAt: FieldValue.serverTimestamp(),
-        }, { merge: true }); 
-    }
-
-    res.json({ "ResultCode": 0, "ResultDesc": "Reversal result processed." });
 });
+
 
 // --- Daraja Reversal Queue Timeout Endpoint ---
 app.post('/daraja-reversal-timeout', async (req, res) => {
