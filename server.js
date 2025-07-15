@@ -772,21 +772,13 @@ app.post('/c2b-confirmation', async (req, res) => {
 
     const MIN_AMOUNT = 5;
     const MAX_AMOUNT = 5000;
+    const amountInt = Math.round(parseFloat(TransAmount));
 
-// Convert amount to full integer
-const amountInt = Math.round(parseFloat(TransAmount));
-
-if (amountInt < MIN_AMOUNT || amountInt > MAX_AMOUNT) {
-    logger.warn(`🛑 Transaction amount ${amountInt} is outside allowed range (${MIN_AMOUNT} - ${MAX_AMOUNT}). Initiating reversal.`);
-    const reversalResult = await initiateDarajaReversal(transactionId, amountInt, mpesaNumber); 
-    if (reversalResult.success) {
-        logger.info(`✅ Reversal initiated for invalid amount ${amountInt} on transaction ${transactionId}`);
-    } else {
-        logger.error(`❌ Reversal failed for invalid amount ${amountInt}: ${reversalResult.message}`);
+    if (amountInt < MIN_AMOUNT || amountInt > MAX_AMOUNT) {
+        logger.warn(`🛑 Amount ${amountInt} is out of allowed bounds. Initiating reversal.`);
+        const reversalResult = await initiateDarajaReversal(transactionId, amountInt, 'L');
+        return;
     }
-    return; // Stop further processing
-}
-
 
     const topupNumber = BillRefNumber.replace(/\D/g, '');
     const amount = parseFloat(TransAmount); // This is the original amount paid by customer
