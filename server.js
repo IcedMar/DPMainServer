@@ -644,35 +644,95 @@ app.post('/c2b-validation', async (req, res) => {
     const callbackData = req.body;
     const now = new Date();
     const transactionIdentifier = callbackData.TransID || `C2B_VALIDATION_${Date.now()}`;
-
-    logger.info('📞 Received C2B Validation Callback:', { TransID: transactionIdentifier, callback: callbackData });
-
-    const { TransAmount } = callbackData;
+    const { TransAmount, BillRefNumber } = callbackData;
     const amount = parseFloat(TransAmount);
-    const MIN_AMOUNT = 5.00;
+    const MIN_AMOUNT = 5.0;
 
-    // --- Validation Check: Amount KES 10 and above ---
-    if (isNaN(amount) || amount < MIN_AMOUNT) {
-        logger.warn(`⚠️ C2B Validation rejected [TransID: ${transactionIdentifier}]: Invalid amount (${TransAmount}). Must be KES ${MIN_AMOUNT} or more.`);
-        await errorsCollection.add({
-            type: 'C2B_VALIDATION_REJECT',
-            subType: 'INVALID_AMOUNT_TOO_LOW',
-            error: `Transaction amount must be KES ${MIN_AMOUNT} or more: ${TransAmount}`,
-            callbackData: callbackData,
-            createdAt: now,
+    try {
+        // ✅ Validate amount
+        if (isNaN(amount) || amount < MIN_AMOUNT) {
+            throw {
+                code: 'C2B00013',
+                desc: `Invalid amount: must be at least KES ${MIN_AMOUNT}`,
+                subType: 'INVALID_AMOUNT_TOO_LOW'
+            };
+        }
+
+        // ✅ Validate phone format
+        const phoneRegex = /^(\+254|254|0)(1|7)\d{8}$/;
+        if (!phoneRegex.test(BillRefNumber)) {
+            throw {
+                code: 'C2B00012',
+                desc: `Invalid BillRefNumber format: ${BillRefNumber}`,
+                subType: 'INVALID_BILL_REF'
+            };
+        }
+
+        // ✅ Detect carrier
+        const carrier = detectCarrier(BillRefNumber);
+        if (carrier === 'Unknown') {
+            throw {
+                code: 'C2B00011',
+                desc: `Could not detect carrier from BillRefNumber: ${BillRefNumber}`,
+                subType: 'CARRIER_UNKNOWN'
+            };
+        }
+
+        // ✅ Fetch settings from Firestore in parallel
+        const [carrierDoc, systemDoc] = await Promise.all([
+            firestore.collection('carrier_settings').doc(carrier).get(),
+            firestore.collection('system_settings').doc('global').get(),
+        ]);
+
+        // ✅ Check system status
+        const systemStatus = systemDoc.exists ? systemDoc.data().status : 'offline';
+        if (systemStatus !== 'online') {
+            throw {
+                code: 'C2B00016',
+                desc: `System is currently offline.`,
+                subType: 'SYSTEM_OFFLINE'
+            };
+        }
+
+        // ✅ Check if carrier is active
+        const carrierActive = carrierDoc.exists ? carrierDoc.data().active : false;
+        if (!carrierActive) {
+            throw {
+                code: 'C2B00011',
+                desc: `${carrier} is currently inactive`,
+                subType: 'CARRIER_INACTIVE'
+            };
+        }
+
+        // ✅ Passed all checks
+        console.info('✅ C2B Validation successful:', {
+            TransID: transactionIdentifier,
+            Amount: TransAmount,
+            Carrier: carrier,
+            Phone: BillRefNumber,
         });
+
         return res.json({
-            "ResultCode": "CB00013",
-            "ResultDesc": "Rejected",
+            ResultCode: '0',
+            ResultDesc: 'Accepted',
+        });
+
+    } catch (err) {
+        console.warn(`❌ Validation failed [${transactionIdentifier}]: ${err.desc}`, { error: err });
+
+        await firestore.collection('errors').add({
+            type: 'C2B_VALIDATION_REJECT',
+            subType: err.subType || 'UNKNOWN_ERROR',
+            error: err.desc || JSON.stringify(err),
+            callbackData,
+            createdAt: FieldValue.serverTimestamp(),
+        });
+
+        return res.json({
+            ResultCode: err.code || 'C2B00016',
+            ResultDesc: 'Rejected',
         });
     }
-
-    // If only amount validation is needed and passed
-    logger.info('✅ C2B Validation successful (amount check only):', { TransID: transactionIdentifier, Amount: TransAmount });
-    res.json({
-        "ResultCode": 0, // Accept
-        "ResultDesc": "Accepted"
-    });
 });
 
 // C2B Confirmation Endpoint (Mandatory)
