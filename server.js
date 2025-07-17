@@ -614,13 +614,6 @@ async function initiateDarajaReversal(transactionId, amount, receiverMsisdn) {
     }
 }
 
-/**
- * Updates the float balance for a specific carrier.
- * @param {string} carrierLogicalName - 'safaricomFloat' or 'africasTalkingFloat'
- * @param {number} amount - The amount to add (positive) or subtract (negative)
- * @returns {Promise<object>} - { success: true, newBalance: number }
- * @throws {Error} if balance goes below zero or doc is invalid
- */
 async function updateCarrierFloatBalance(carrierLogicalName, amount) {
     return firestore.runTransaction(async t => {
         let floatDocRef;
@@ -665,6 +658,470 @@ async function updateCarrierFloatBalance(carrierLogicalName, amount) {
 }
 
 // --- C2B (Offline Paybill) Callbacks ---
+/**
+ * Processes the airtime fulfillment for a given transaction.
+ * This function is designed to be called by both C2B confirmation and STK Push callback.
+ *
+ * @param {object} params - The parameters for fulfillment.
+ * @param {string} params.transactionId - The unique M-Pesa transaction ID (TransID or CheckoutRequestID).
+ * @param {number} params.originalAmountPaid - The original amount paid by the customer.
+ * @param {string} params.payerMsisdn - The phone number of the customer who paid.
+ * @param {string} params.payerName - The name of the customer (optional, can be null for STK Push).
+ * @param {string} params.topupNumber - The recipient phone number for airtime.
+ * @param {string} params.sourceCallbackData - The raw callback data from M-Pesa (C2B or STK Push).
+ * @param {string} params.requestType - 'C2B' or 'STK_PUSH' to differentiate logging/storage.
+ * @param {string|null} [params.relatedSaleId=null] - Optional: saleId if already created (e.g., from STK Push initial request).
+ * @returns {Promise<object>} - An object indicating success/failure and final status.
+ */
+async function processAirtimeFulfillment({
+    transactionId,
+    originalAmountPaid,
+    payerMsisdn,
+    payerName,
+    topupNumber,
+    sourceCallbackData,
+    requestType,
+    relatedSaleId = null
+}) {
+    const now = FieldValue.serverTimestamp(); // Use server timestamp for consistency
+    logger.info(`Starting airtime fulfillment for ${requestType} transaction: ${transactionId}`);
+
+    let airtimeDispatchStatus = 'FAILED';
+    let airtimeDispatchResult = null;
+    let saleErrorMessage = null;
+    let airtimeProviderUsed = null;
+    let finalSaleId = relatedSaleId; // Use existing saleId if provided
+
+    try {
+        // --- Input Validation (amount range - moved from C2B, now applies to both) ---
+        // Note: For STK Push, amount validation happens before dispatch.
+        // For C2B, it's here because the initial recording happens before this logic.
+        const MIN_AMOUNT = 5;
+        const MAX_AMOUNT = 5000;
+        const amountInt = Math.round(parseFloat(originalAmountPaid));
+
+        if (amountInt < MIN_AMOUNT || amountInt > MAX_AMOUNT) {
+            const errorMessage = `Transaction amount ${amountInt} is outside allowed range (${MIN_AMOUNT} - ${MAX_AMOUNT}).`;
+            logger.warn(`🛑 ${errorMessage} Initiating reversal for ${transactionId}.`);
+            await errorsCollection.add({
+                type: 'AIRTIME_FULFILLMENT_ERROR',
+                subType: 'INVALID_AMOUNT_RANGE',
+                error: errorMessage,
+                transactionId: transactionId,
+                originalAmount: originalAmountPaid,
+                payerMsisdn: payerMsisdn,
+                topupNumber: topupNumber,
+                requestType: requestType,
+                createdAt: now,
+            });
+
+            // Update transaction status before attempting reversal
+            await transactionsCollection.doc(transactionId).update({
+                status: 'RECEIVED_FULFILLMENT_FAILED',
+                fulfillmentStatus: 'FAILED_INVALID_AMOUNT',
+                errorMessage: errorMessage,
+                lastUpdated: now,
+            });
+
+            const reversalResult = await initiateDarajaReversal(transactionId, originalAmountPaid, payerMsisdn);
+            if (reversalResult.success) {
+                logger.info(`✅ Reversal initiated for invalid amount ${amountInt} on transaction ${transactionId}`);
+                await reconciledTransactionsCollection.doc(transactionId).set({
+                    transactionId: transactionId,
+                    amount: originalAmountPaid,
+                    mpesaNumber: payerMsisdn,
+                    reversalInitiatedAt: now,
+                    reversalRequestDetails: reversalResult.data,
+                    originalCallbackData: sourceCallbackData,
+                    status: 'REVERSAL_INITIATED',
+                    createdAt: now,
+                }, { merge: true });
+                await transactionsCollection.doc(transactionId).update({
+                    status: 'REVERSAL_PENDING_CONFIRMATION',
+                    lastUpdated: now,
+                    reversalDetails: reversalResult.data,
+                    errorMessage: reversalResult.message,
+                    reversalAttempted: true,
+                });
+                return { success: true, status: 'REVERSAL_INITIATED_INVALID_AMOUNT' }; // Return success as reversal was initiated
+            } else {
+                logger.error(`❌ Reversal failed for invalid amount ${amountInt} for ${transactionId}: ${reversalResult.message}`);
+                await failedReconciliationsCollection.doc(transactionId).set({
+                    transactionId: transactionId,
+                    amount: originalAmountPaid,
+                    mpesaNumber: payerMsisdn,
+                    reversalAttemptedAt: now,
+                    reversalFailureDetails: reversalResult.error,
+                    originalCallbackData: sourceCallbackData,
+                    reason: `Reversal initiation failed for invalid amount: ${reversalResult.message}`,
+                    createdAt: now,
+                }, { merge: true });
+                await transactionsCollection.doc(transactionId).update({
+                    status: 'REVERSAL_INITIATION_FAILED',
+                    lastUpdated: now,
+                    reversalDetails: reversalResult.error,
+                    errorMessage: `Reversal initiation failed for invalid amount: ${reversalResult.message}`,
+                    reversalAttempted: true,
+                });
+                return { success: false, status: 'REVERSAL_FAILED_INVALID_AMOUNT', error: reversalResult.message };
+            }
+        }
+
+
+        // --- Determine target carrier ---
+        const targetCarrier = detectCarrier(topupNumber);
+        if (targetCarrier === 'Unknown') {
+            const errorMessage = `Unsupported carrier prefix for airtime top-up: ${topupNumber}`;
+            logger.error(`❌ ${errorMessage}`, { TransID: transactionId, topupNumber: topupNumber });
+            await errorsCollection.add({
+                type: 'AIRTIME_FULFILLMENT_ERROR',
+                subType: 'UNKNOWN_CARRIER',
+                error: errorMessage,
+                transactionId: transactionId,
+                requestType: requestType,
+                createdAt: now,
+            });
+            await transactionsCollection.doc(transactionId).update({
+                status: 'RECEIVED_FULFILLMENT_FAILED',
+                fulfillmentStatus: 'FAILED_UNKNOWN_CARRIER',
+                errorMessage: errorMessage,
+                lastUpdated: now,
+            });
+            return { success: false, status: 'FAILED_UNKNOWN_CARRIER', error: errorMessage };
+        }
+
+        // --- FETCH BONUS SETTINGS AND CALCULATE FINAL AMOUNT TO DISPATCH ---
+        const bonusDocRef = firestore.collection('airtime_bonuses').doc('current_settings');
+        const bonusDocSnap = await bonusDocRef.get();
+
+        let safaricomBonus = 0;
+        let atBonus = 0;
+
+        if (bonusDocSnap.exists) {
+            safaricomBonus = bonusDocSnap.data()?.safaricomPercentage ?? 0;
+            atBonus = bonusDocSnap.data()?.africastalkingPercentage ?? 0;
+        } else {
+            logger.warn('Bonus settings document does not exist. Skipping bonus application.');
+        }
+
+        let finalAmountToDispatch = originalAmountPaid;
+        let bonusApplied = 0;
+
+        // Custom rounding: 0.1–0.4 => 0, 0.5–0.9 => 1
+        const customRound = (value) => {
+            const decimalPart = value % 1;
+            const integerPart = Math.floor(value);
+            return decimalPart >= 0.5 ? integerPart + 1 : integerPart;
+        };
+
+        // Apply bonus with optional rounding
+        const applyBonus = (amount, percentage, label, round = false) => {
+            const rawBonus = amount * (percentage / 100);
+            const bonus = round ? customRound(rawBonus) : rawBonus;
+            const total = amount + bonus;
+            logger.info(
+                `Applying ${percentage}% ${label} bonus. Original: ${amount}, Bonus: ${bonus} (${round ? 'rounded' : 'raw'}), Final: ${total}`
+            );
+            return { total, bonus, rawBonus };
+        };
+
+        // Normalize carrier name to lowercase
+        const carrierNormalized = targetCarrier.toLowerCase();
+
+        if (carrierNormalized === 'safaricom' && safaricomBonus > 0) {
+            const result = applyBonus(originalAmountPaid, safaricomBonus, 'Safaricom', false); // No rounding
+            finalAmountToDispatch = result.total;
+            bonusApplied = result.rawBonus;
+        } else if (['airtel', 'telkom', 'equitel', 'faiba'].includes(carrierNormalized) && atBonus > 0) {
+            const result = applyBonus(originalAmountPaid, atBonus, 'AfricasTalking', true); // Use custom rounding
+            finalAmountToDispatch = result.total;
+            bonusApplied = result.bonus;
+        }
+
+        logger.info(`Final amount to dispatch for ${transactionId}: ${finalAmountToDispatch}`);
+
+        // --- Initialize or Update sale document ---
+        const saleData = {
+            relatedTransactionId: transactionId,
+            topupNumber: topupNumber,
+            originalAmountPaid: originalAmountPaid,
+            amount: finalAmountToDispatch, // This is the amount actually dispatched (original + bonus)
+            bonusApplied: bonusApplied, // Store the bonus amount
+            carrier: targetCarrier, // Use the detected carrier
+            status: 'PENDING_DISPATCH',
+            dispatchAttemptedAt: now,
+            lastUpdated: now,
+            requestType: requestType, // C2B or STK_PUSH
+            // createdAt will be set if this is a new document, or remain if it's an update
+        };
+
+        if (finalSaleId) {
+            // If relatedSaleId exists (from STK Push initial request), update it
+            const saleDoc = await salesCollection.doc(finalSaleId).get();
+            if (saleDoc.exists) {
+                await salesCollection.doc(finalSaleId).update(saleData);
+                logger.info(`✅ Updated existing sale document ${finalSaleId} for TransID ${transactionId} with fulfillment details.`);
+            } else {
+                // If ID was provided but document doesn't exist (e.g., deleted), create new one
+                const newSaleRef = salesCollection.doc();
+                finalSaleId = newSaleRef.id;
+                await newSaleRef.set({ saleId: finalSaleId, createdAt: now, ...saleData });
+                logger.warn(`⚠️ Sale document ${relatedSaleId} not found. Created new sale document ${finalSaleId} for TransID ${transactionId}.`);
+            }
+        } else {
+            // Create a new sale document (typical for C2B)
+            const newSaleRef = salesCollection.doc();
+            finalSaleId = newSaleRef.id;
+            await newSaleRef.set({ saleId: finalSaleId, createdAt: now, ...saleData });
+            logger.info(`✅ Initialized new sale document ${finalSaleId} in 'sales' collection for TransID ${transactionId}.`);
+        }
+
+        // --- Conditional Airtime Dispatch Logic based on Carrier ---
+        if (targetCarrier === 'Safaricom') {
+            try {
+                await updateCarrierFloatBalance('safaricomFloat', -finalAmountToDispatch);
+                airtimeProviderUsed = 'SafaricomDealer';
+                airtimeDispatchResult = await sendSafaricomAirtime(topupNumber, finalAmountToDispatch);
+
+                if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
+                    airtimeDispatchStatus = 'COMPLETED';
+                    logger.info(`✅ Safaricom airtime successfully sent via Dealer Portal for sale ${finalSaleId}.`);
+                } else {
+                    saleErrorMessage = airtimeDispatchResult?.error || 'Safaricom Dealer Portal failed with unknown error.';
+                    logger.warn(`⚠️ Safaricom Dealer Portal failed for TransID ${transactionId}. Attempting fallback to Africastalking. Error: ${saleErrorMessage}`);
+
+                    // Refund Safaricom float, as primary attempt failed
+                    await updateCarrierFloatBalance('safaricomFloat', finalAmountToDispatch);
+                    logger.info(`✅ Refunded Safaricom float for TransID ${transactionId}: +${finalAmountToDispatch}`);
+
+                    // Attempt fallback via Africa's Talking (debit AT float)
+                    await updateCarrierFloatBalance('africasTalkingFloat', -finalAmountToDispatch);
+                    airtimeProviderUsed = 'AfricasTalkingFallback';
+                    airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
+
+                    if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
+                        airtimeDispatchStatus = 'COMPLETED';
+                        logger.info(`✅ Safaricom fallback airtime successfully sent via AfricasTalking for sale ${finalSaleId}.`);
+                        // NEW: Adjust Africa's Talking float for 4% commission
+                        const commissionAmount = parseFloat((originalAmountPaid * 0.04).toFixed(2));
+                        await updateCarrierFloatBalance('africasTalkingFloat', commissionAmount);
+                        logger.info(`✅ Credited Africa's Talking float with ${commissionAmount} (4% commission) for TransID ${transactionId}.`);
+                    } else {
+                        saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'AfricasTalking fallback failed with no specific error.';
+                        logger.error(`❌ Safaricom fallback via AfricasTalking failed for sale ${finalSaleId}: ${saleErrorMessage}`);
+                    }
+                }
+            } catch (dispatchError) {
+                saleErrorMessage = `Safaricom primary dispatch process failed (or float debit failed): ${dispatchError.message}`;
+                logger.error(`❌ Safaricom primary dispatch process failed for TransID ${transactionId}: ${dispatchError.message}`);
+            }
+
+        } else if (['Airtel', 'Telkom', 'Equitel', 'Faiba'].includes(targetCarrier)) {
+            // Directly dispatch via Africa's Talking
+            try {
+                await updateCarrierFloatBalance('africasTalkingFloat', -finalAmountToDispatch);
+                airtimeProviderUsed = 'AfricasTalkingDirect';
+                airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
+
+                if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
+                    airtimeDispatchStatus = 'COMPLETED';
+                    logger.info(`✅ AfricasTalking airtime successfully sent directly for sale ${finalSaleId}.`);
+                    // NEW: Adjust Africa's Talking float for 4% commission
+                    const commissionAmount = parseFloat((originalAmountPaid * 0.04).toFixed(2));
+                    await updateCarrierFloatBalance('africasTalkingFloat', commissionAmount);
+                    logger.info(`✅ Credited Africa's Talking float with ${commissionAmount} (4% commission) for TransID ${transactionId}.`);
+                } else {
+                    saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.Safaricom : 'AfricasTalking direct dispatch failed with no specific error.';
+                    logger.error(`❌ AfricasTalking direct dispatch failed for sale ${finalSaleId}: ${saleErrorMessage}`);
+                }
+            } catch (dispatchError) {
+                saleErrorMessage = `AfricasTalking direct dispatch process failed (or float debit failed): ${dispatchError.message}`;
+                logger.error(`❌ AfricasTalking direct dispatch process failed for TransID ${transactionId}: ${dispatchError.message}`);
+            }
+        } else {
+            // This case should ideally be caught by the initial detectCarrier check, but good for robustness
+            saleErrorMessage = `No valid dispatch path for carrier: ${targetCarrier}`;
+            logger.error(`❌ ${saleErrorMessage} for TransID ${transactionId}`);
+            await errorsCollection.add({
+                type: 'AIRTIME_FULFILLMENT_ERROR',
+                subType: 'NO_DISPATCH_PATH',
+                error: saleErrorMessage,
+                transactionId: transactionId,
+                requestType: requestType,
+                createdAt: now,
+            });
+        }
+
+        const updateSaleFields = {
+            lastUpdated: now,
+            dispatchResult: airtimeDispatchResult?.data || airtimeDispatchResult?.error || airtimeDispatchResult,
+            airtimeProviderUsed: airtimeProviderUsed,
+        };
+
+        // If airtime dispatch was COMPLETELY successful
+        if (airtimeDispatchStatus === 'COMPLETED') {
+            updateSaleFields.status = airtimeDispatchStatus;
+
+            // Only update Safaricom float balance from API response if Safaricom Dealer was used and successful
+            if (targetCarrier === 'Safaricom' && airtimeDispatchResult && airtimeDispatchResult.newSafaricomFloatBalance !== undefined && airtimeProviderUsed === 'SafaricomDealer') {
+                try {
+                    await safaricomFloatDocRef.update({
+                        balance: airtimeDispatchResult.newSafaricomFloatBalance,
+                        lastUpdated: now
+                    });
+                    logger.info(`✅ Safaricom float balance directly updated from API response for TransID ${transactionId}. New balance: ${airtimeDispatchResult.newSafaricomFloatBalance}`);
+                } catch (floatUpdateErr) {
+                    logger.error(`❌ Failed to directly update Safaricom float from API response for TransID ${transactionId}:`, {
+                        error: floatUpdateErr.message, reportedBalance: airtimeDispatchResult.newSafaricomFloatBalance
+                    });
+                    const reportedBalanceForError = airtimeDispatchResult.newSafaricomFloatBalance !== undefined ? airtimeDispatchResult.newSafaricomFloatBalance : 'N/A';
+                    await errorsCollection.add({
+                        type: 'FLOAT_RECONCILIATION_WARNING',
+                        subType: 'SAFARICOM_REPORTED_BALANCE_UPDATE_FAILED',
+                        error: `Failed to update Safaricom float with reported balance: ${floatUpdateErr.message}`,
+                        transactionId: transactionId,
+                        saleId: finalSaleId,
+                        reportedBalance: reportedBalanceForError,
+                        createdAt: now,
+                    });
+                }
+            }
+            await salesCollection.doc(finalSaleId).update(updateSaleFields);
+            logger.info(`✅ Updated sale document ${finalSaleId} with dispatch result (COMPLETED).`);
+
+            // Also update the main transaction status to fulfilled
+            await transactionsCollection.doc(transactionId).update({
+                status: 'COMPLETED_AND_FULFILLED',
+                fulfillmentStatus: airtimeDispatchStatus,
+                fulfillmentDetails: airtimeDispatchResult,
+                lastUpdated: now,
+                airtimeProviderUsed: airtimeProviderUsed,
+            });
+            logger.info(`✅ Transaction ${transactionId} marked as COMPLETED_AND_FULFILLED.`);
+            return { success: true, status: 'COMPLETED_AND_FULFILLED' };
+
+        } else {
+            // Airtime dispatch ultimately failed (either primary or fallback)
+            saleErrorMessage = saleErrorMessage || 'Airtime dispatch failed with no specific error message.';
+            logger.error(`❌ Airtime dispatch ultimately failed for sale ${finalSaleId} (TransID ${transactionId}):`, {
+                error_message: saleErrorMessage,
+                carrier: targetCarrier,
+                topupNumber: topupNumber,
+                originalAmountPaid: originalAmountPaid,
+                finalAmountDispatched: finalAmountToDispatch,
+                airtimeResponse: airtimeDispatchResult,
+                sourceCallbackData: sourceCallbackData,
+            });
+            await errorsCollection.add({
+                type: 'AIRTIME_FULFILLMENT_ERROR',
+                subType: 'AIRTIME_DISPATCH_FAILED',
+                error: saleErrorMessage,
+                transactionId: transactionId,
+                saleId: finalSaleId,
+                sourceCallbackData: sourceCallbackData,
+                airtimeApiResponse: airtimeDispatchResult,
+                providerAttempted: airtimeProviderUsed,
+                requestType: requestType,
+                createdAt: now,
+            });
+
+            updateSaleFields.status = 'FAILED_DISPATCH_API';
+            updateSaleFields.errorMessage = saleErrorMessage;
+            await salesCollection.doc(finalSaleId).update(updateSaleFields);
+            logger.info(`✅ Updated sale document ${finalSaleId} with dispatch result (FAILED).`);
+
+            // --- Initiate Reversal if airtime dispatch failed ---
+            logger.warn(`🛑 Airtime dispatch ultimately failed for TransID ${transactionId}. Initiating Daraja reversal.`);
+
+            // Update main transaction status to reflect immediate failure
+            await transactionsCollection.doc(transactionId).update({
+                status: 'RECEIVED_FULFILLMENT_FAILED',
+                fulfillmentStatus: 'FAILED_DISPATCH_API',
+                fulfillmentDetails: airtimeDispatchResult,
+                errorMessage: saleErrorMessage,
+                lastUpdated: now,
+                airtimeProviderUsed: airtimeProviderUsed,
+                reversalAttempted: true,
+            });
+
+            const reversalResult = await initiateDarajaReversal(transactionId, originalAmountPaid, payerMsisdn);
+
+            if (reversalResult.success) {
+                logger.info(`✅ Daraja reversal initiated successfully for TransID ${transactionId}.`);
+                await reconciledTransactionsCollection.doc(transactionId).set({
+                    transactionId: transactionId,
+                    amount: originalAmountPaid,
+                    mpesaNumber: payerMsisdn,
+                    reversalInitiatedAt: now,
+                    reversalRequestDetails: reversalResult.data,
+                    originalCallbackData: sourceCallbackData,
+                    status: 'REVERSAL_INITIATED',
+                    createdAt: now,
+                }, { merge: true });
+                await transactionsCollection.doc(transactionId).update({
+                    status: 'REVERSAL_PENDING_CONFIRMATION',
+                    lastUpdated: now,
+                    reversalDetails: reversalResult.data,
+                    errorMessage: reversalResult.message,
+                });
+                return { success: true, status: 'REVERSAL_INITIATED' };
+            } else {
+                logger.error(`❌ Daraja reversal failed to initiate for TransID ${transactionId}: ${reversalResult.message}`);
+                await failedReconciliationsCollection.doc(transactionId).set({
+                    transactionId: transactionId,
+                    amount: originalAmountPaid,
+                    mpesaNumber: payerMsisdn,
+                    reversalAttemptedAt: now,
+                    reversalFailureDetails: reversalResult.error,
+                    originalCallbackData: sourceCallbackData,
+                    reason: reversalResult.message,
+                    createdAt: now,
+                }, { merge: true });
+                await transactionsCollection.doc(transactionId).update({
+                    status: 'REVERSAL_INITIATION_FAILED',
+                    lastUpdated: now,
+                    reversalDetails: reversalResult.error,
+                    errorMessage: `Reversal initiation failed: ${reversalResult.message}`
+                });
+                return { success: false, status: 'REVERSAL_INITIATION_FAILED', error: reversalResult.message };
+            }
+        }
+    } catch (error) {
+        logger.error(`❌ CRITICAL ERROR during Airtime Fulfillment for TransID ${transactionId}:`, {
+            message: error.message,
+            stack: error.stack,
+            sourceCallbackData: sourceCallbackData,
+            requestType: requestType,
+        });
+
+        // Ensure main transaction record reflects critical error
+        if (transactionId) {
+            try {
+                await transactionsCollection.doc(transactionId).update({
+                    status: 'CRITICAL_FULFILLMENT_ERROR',
+                    errorMessage: `Critical server error during airtime fulfillment: ${error.message}`,
+                    lastUpdated: now,
+                });
+            } catch (updateError) {
+                logger.error(`❌ Failed to update transaction ${transactionId} after critical fulfillment error:`, updateError.message);
+            }
+        }
+
+        // Add to errors collection as a fallback
+        await errorsCollection.add({
+            type: 'CRITICAL_FULFILLMENT_ERROR',
+            error: error.message,
+            stack: error.stack,
+            transactionId: transactionId,
+            requestType: requestType,
+            sourceCallbackData: sourceCallbackData,
+            createdAt: now,
+        });
+
+        return { success: false, status: 'CRITICAL_ERROR', error: error.message };
+    }
+}
+
 
 // C2B Validation Endpoint
 app.post('/c2b-validation', async (req, res) => {
@@ -755,8 +1212,8 @@ app.post('/c2b-validation', async (req, res) => {
 // C2B Confirmation Endpoint (Mandatory)
 app.post('/c2b-confirmation', async (req, res) => {
     const callbackData = req.body;
-    const now = new Date();
     const transactionId = callbackData.TransID;
+    const now = FieldValue.serverTimestamp(); // Use server timestamp
 
     logger.info('📞 Received C2B Confirmation Callback:', { TransID: transactionId, callback: callbackData });
 
@@ -770,26 +1227,10 @@ app.post('/c2b-confirmation', async (req, res) => {
         LastName,
     } = callbackData;
 
-    const MIN_AMOUNT = 5;
-    const MAX_AMOUNT = 5000;
-    const amountInt = Math.round(parseFloat(TransAmount));
-
-    if (amountInt < MIN_AMOUNT || amountInt > MAX_AMOUNT) {
-        logger.warn(`🛑 Amount ${amountInt} is out of allowed bounds. Initiating reversal.`);
-        const reversalResult = await initiateDarajaReversal(transactionId, amountInt, 'L');
-        return;
-    }
-
     const topupNumber = BillRefNumber.replace(/\D/g, '');
     const amount = parseFloat(TransAmount); // This is the original amount paid by customer
     const mpesaNumber = MSISDN;
     const customerName = `${FirstName || ''} ${MiddleName || ''} ${LastName || ''}`.trim();
-
-    let saleId = null;
-    let airtimeDispatchStatus = 'FAILED';
-    let airtimeDispatchResult = null;
-    let saleErrorMessage = null;
-    let airtimeProviderUsed = null;
 
     try {
         // --- 1. Record the incoming M-Pesa transaction (money received) ---
@@ -801,314 +1242,34 @@ app.post('/c2b-confirmation', async (req, res) => {
 
         await transactionsCollection.doc(transactionId).set({
             transactionID: transactionId,
+            type: 'C2B_PAYMENT', // Explicitly mark type
             transactionTime: TransTime,
             amountReceived: amount, // Original amount paid by customer
             payerMsisdn: mpesaNumber,
             payerName: customerName,
             billRefNumber: topupNumber,
             mpesaRawCallback: callbackData,
-            status: 'RECEIVED_PENDING_SALE',
-            createdAt: FieldValue.serverTimestamp(), // Use server timestamp
-            lastUpdated: FieldValue.serverTimestamp(), // Use server timestamp
+            status: 'RECEIVED_PENDING_FULFILLMENT', // Set status to pending fulfillment
+            fulfillmentStatus: 'PENDING', // Initial fulfillment status
+            createdAt: now,
+            lastUpdated: now,
         });
         logger.info(`✅ Recorded incoming transaction ${transactionId} in 'transactions' collection.`);
 
-        // --- 2. Determine target carrier and its float logical name ---
-        const targetCarrier = detectCarrier(topupNumber);
-        if (targetCarrier === 'Unknown') {
-            const errorMessage = `Unsupported carrier prefix for airtime top-up: ${topupNumber}`;
-            logger.error(`❌ ${errorMessage}`, { TransID: transactionId, topupNumber: topupNumber, callback: callbackData });
-            await errorsCollection.add({
-                type: 'AIRTIME_SALE_ERROR',
-                subType: 'UNKNOWN_CARRIER',
-                error: errorMessage,
-                transactionId: transactionId,
-                callbackData: callbackData,
-                createdAt: FieldValue.serverTimestamp(),
-            });
-            await transactionsCollection.doc(transactionId).update({
-                status: 'RECEIVED_FULFILLMENT_FAILED',
-                fulfillmentStatus: 'FAILED_UNKNOWN_CARRIER',
-                errorMessage: errorMessage,
-                lastUpdated: FieldValue.serverTimestamp(),
-            });
-            return res.json({ "ResultCode": 0, "ResultDesc": "C2B confirmation received, but airtime not dispatched due to unsupported carrier." });
-        }
-
-       // --- FETCH BONUS SETTINGS AND CALCULATE FINAL AMOUNT TO DISPATCH ---
-        const bonusDocRef = firestore.collection('airtime_bonuses').doc('current_settings');
-        const bonusDocSnap = await bonusDocRef.get();
-
-        if (!bonusDocSnap.exists) {
-            logger.warn('Bonus settings document does not exist. Skipping bonus application.');
-        }
-
-        const safaricomBonus = bonusDocSnap?.data()?.safaricomPercentage ?? 0;
-        const atBonus = bonusDocSnap?.data()?.africastalkingPercentage ?? 0;
-
-        let finalAmountToDispatch = amount;
-        let bonusApplied = 0;
-
-        // Custom rounding: 0.1–0.4 => 0, 0.5–0.9 => 1
-        const customRound = (value) => {
-            const decimalPart = value % 1;
-            const integerPart = Math.floor(value);
-            return decimalPart >= 0.5 ? integerPart + 1 : integerPart;
-        };
-
-        // Apply bonus with optional rounding
-        const applyBonus = (percentage, label, round = false) => {
-            const rawBonus = amount * (percentage / 100);
-            const bonus = round ? customRound(rawBonus) : rawBonus;
-            const total = amount + bonus;
-            logger.info(
-                `Applying ${percentage}% ${label} bonus. Original: ${amount}, Bonus: ${bonus} (${round ? 'rounded' : 'raw'}), Final: ${total}`
-        );
-        return { total, bonus, rawBonus };
-        };
-
-        // Normalize carrier name to lowercase
-        const carrierNormalized = targetCarrier?.toLowerCase();
-
-        if (carrierNormalized === 'safaricom' && safaricomBonus > 0) {
-            const result = applyBonus(safaricomBonus, 'Safaricom', false); // No rounding
-        finalAmountToDispatch = result.total;
-        bonusApplied = result.rawBonus;
-        } else if (['airtel', 'telkom', 'equitel', 'faiba'].includes(carrierNormalized) && atBonus > 0) {
-        const result = applyBonus(atBonus, 'AfricasTalking', true); // Use custom rounding
-        finalAmountToDispatch = result.total;
-        bonusApplied = result.bonus;
-    }
-
-    logger.info(`Final amount to dispatch: ${finalAmountToDispatch}`);
-
-
-
-        // Initialize sale document early
-        const saleRef = salesCollection.doc();
-        saleId = saleRef.id;
-        await saleRef.set({
-            saleId: saleId,
-            relatedTransactionId: transactionId,
+        // --- 2. Trigger the unified airtime fulfillment process ---
+        const fulfillmentResult = await processAirtimeFulfillment({
+            transactionId: transactionId,
+            originalAmountPaid: amount,
+            payerMsisdn: mpesaNumber,
+            payerName: customerName,
             topupNumber: topupNumber,
-            originalAmountPaid: amount, // Store the original amount paid by customer
-            amount: finalAmountToDispatch, // This is the amount actually dispatched (original + bonus)
-            bonusApplied: bonusApplied, // Store the bonus amount
-            carrier: targetCarrier, // Use the detected carrier
-            status: 'PENDING_DISPATCH',
-            dispatchAttemptedAt: FieldValue.serverTimestamp(), // Use server timestamp
-            createdAt: FieldValue.serverTimestamp(), // Use server timestamp
-            lastUpdated: FieldValue.serverTimestamp(), // Use server timestamp
+            sourceCallbackData: callbackData,
+            requestType: 'C2B',
+            // relatedSaleId is null here as C2B creates its own sale doc
         });
-        logger.info(`✅ Initialized sale document ${saleId} in 'sales' collection for TransID ${transactionId} with bonus details.`);
 
-
-        // --- Conditional Airtime Dispatch Logic based on Carrier ---
-        if (targetCarrier === 'Safaricom') {
-            // Debit Safaricom float for primary attempt
-            try {
-                await updateCarrierFloatBalance('safaricomFloat', -finalAmountToDispatch);
-                airtimeProviderUsed = 'SafaricomDealer';
-                airtimeDispatchResult = await sendSafaricomAirtime(topupNumber, finalAmountToDispatch);
-
-                if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
-                    airtimeDispatchStatus = 'COMPLETED';
-                    logger.info(`✅ Safaricom airtime successfully sent via Dealer Portal for sale ${saleId}.`);
-                } else {
-                    saleErrorMessage = airtimeDispatchResult?.error || 'Safaricom Dealer Portal failed with unknown error.';
-                    logger.warn(`⚠️ Safaricom Dealer Portal failed for TransID ${transactionId}. Attempting fallback to Africastalking. Error: ${saleErrorMessage}`);
-
-                    // Refund Safaricom float, as primary attempt failed
-                    await updateCarrierFloatBalance('safaricomFloat', finalAmountToDispatch);
-                    logger.info(`✅ Refunded Safaricom float for TransID ${transactionId}: +${finalAmountToDispatch}`);
-
-                    // Attempt fallback via Africa's Talking (debit AT float)
-                    await updateCarrierFloatBalance('africasTalkingFloat', -finalAmountToDispatch); 
-                    airtimeProviderUsed = 'AfricasTalkingFallback';
-                    airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
-
-                    if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
-                        airtimeDispatchStatus = 'COMPLETED';
-                        logger.info(`✅ Safaricom fallback airtime successfully sent via Africastalking for sale ${saleId}.`);
-                        // NEW: Adjust Africa's Talking float for 4% commission
-                        const commissionAmount = parseFloat((amount * 0.04).toFixed(2));
-                        await updateCarrierFloatBalance('africasTalkingFloat', commissionAmount);
-                        logger.info(`✅ Credited Africa's Talking float with ${commissionAmount} (4% commission) for TransID ${transactionId}.`);
-                    } else {
-                        saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.error : 'Africastalking fallback failed with no specific error.';
-                        logger.error(`❌ Safaricom fallback via Africastalking failed for sale ${saleId}: ${saleErrorMessage}`);
-                    }
-                }
-            } catch (dispatchError) {
-                saleErrorMessage = `Safaricom primary dispatch process failed (or float debit failed): ${dispatchError.message}`;
-                logger.error(`❌ Safaricom primary dispatch process failed for TransID ${transactionId}: ${dispatchError.message}`);
-            }
-
-        } else if (['Airtel', 'Telkom', 'Equitel', 'Faiba'].includes(targetCarrier)) {
-            // Directly dispatch via Africa's Talking
-            try {
-                await updateCarrierFloatBalance('africasTalkingFloat', -finalAmountToDispatch);
-                airtimeProviderUsed = 'AfricasTalkingDirect';
-                airtimeDispatchResult = await sendAfricasTalkingAirtime(topupNumber, finalAmountToDispatch, targetCarrier);
-
-                if (airtimeDispatchResult && airtimeDispatchResult.status === 'SUCCESS') {
-                    airtimeDispatchStatus = 'COMPLETED';
-                    logger.info(`✅ AfricasTalking airtime successfully sent directly for sale ${saleId}.`);
-                    // NEW: Adjust Africa's Talking float for 4% commission
-                    const commissionAmount = parseFloat((amount * 0.04).toFixed(2));
-                    await updateCarrierFloatBalance('africasTalkingFloat', commissionAmount);
-                    logger.info(`✅ Credited Africa's Talking float with ${commissionAmount} (4% commission) for TransID ${transactionId}.`);
-                } else {
-                    saleErrorMessage = airtimeDispatchResult ? airtimeDispatchResult.Safaricom : 'Africastalking direct dispatch failed with no specific error.';
-                    logger.error(`❌ AfricasTalking direct dispatch failed for sale ${saleId}: ${saleErrorMessage}`);
-                }
-            } catch (dispatchError) {
-                saleErrorMessage = `AfricasTalking direct dispatch process failed (or float debit failed): ${dispatchError.message}`;
-                logger.error(`❌ AfricasTalking direct dispatch process failed for TransID ${transactionId}: ${dispatchError.message}`);
-            }
-        } else {
-            // This case should ideally be caught by the initial detectCarrier check, but good for robustness
-            saleErrorMessage = `No valid dispatch path for carrier: ${targetCarrier}`;
-            logger.error(`❌ ${saleErrorMessage} for TransID ${transactionId}`);
-            await errorsCollection.add({
-                type: 'AIRTIME_SALE_ERROR',
-                subType: 'NO_DISPATCH_PATH',
-                error: saleErrorMessage,
-                transactionId: transactionId,
-                callbackData: callbackData,
-                createdAt: FieldValue.serverTimestamp(),
-            });
-        }
-
-        const updateSaleFields = {
-            lastUpdated: FieldValue.serverTimestamp(), // Use server timestamp
-            dispatchResult: airtimeDispatchResult?.data || airtimeDispatchResult?.error || airtimeDispatchResult, // Store raw API response/error
-            airtimeProviderUsed: airtimeProviderUsed, // New field to track provider used
-        };
-
-        if (airtimeDispatchStatus === 'COMPLETED') { // Check the consolidated status
-            updateSaleFields.status = airtimeDispatchStatus;
-
-            // Only update Safaricom float balance from API response if Safaricom Dealer was used and successful
-            if (targetCarrier === 'Safaricom' && airtimeDispatchResult.newSafaricomFloatBalance !== null && airtimeProviderUsed === 'SafaricomDealer') {
-                try {
-                    await safaricomFloatDocRef.update({
-                        balance: airtimeDispatchResult.newSafaricomFloatBalance,
-                        lastUpdated: FieldValue.serverTimestamp()
-                    });
-                    logger.info(`✅ Safaricom float balance directly updated from API response for TransID ${transactionId}. New balance: ${airtimeDispatchResult.newSafaricomFloatBalance}`);
-                } catch (floatUpdateErr) {
-                    logger.error(`❌ Failed to directly update Safaricom float from API response for TransID ${transactionId}:`, {
-                        error: floatUpdateErr.message, reportedBalance: airtimeDispatchResult.newSafaricomFloatBalance
-                    });
-                    const reportedBalanceForError = airtimeDispatchResult.newSafaricomFloatBalance !== null ? airtimeDispatchResult.newSafaricomFloatBalance : 'N/A';
-                    await errorsCollection.add({
-                        type: 'FLOAT_RECONCILIATION_WARNING',
-                        subType: 'SAFARICOM_REPORTED_BALANCE_UPDATE_FAILED',
-                        error: `Failed to update Safaricom float with reported balance: ${floatUpdateErr.message}`,
-                        transactionId: transactionId,
-                        saleId: saleId,
-                        reportedBalance: reportedBalanceForError,
-                        createdAt: FieldValue.serverTimestamp(),
-                    });
-                }
-            }
-        } else {
-            // Airtime dispatch ultimately failed (either primary or fallback)
-            saleErrorMessage = saleErrorMessage || 'Airtime dispatch failed with no specific error message.'; // Ensure it's not null
-            logger.error(`❌ Airtime dispatch failed for sale ${saleId} (TransID ${transactionId}):`, {
-                error_message: saleErrorMessage,
-                carrier: targetCarrier,
-                topupNumber: topupNumber,
-                originalAmountPaid: amount,
-                finalAmountDispatched: finalAmountToDispatch,
-                airtimeResponse: airtimeDispatchResult,
-                callbackData: callbackData,
-            });
-            await errorsCollection.add({
-                type: 'AIRTIME_SALE_ERROR',
-                subType: 'AIRTIME_DISPATCH_FAILED', // This subType remains generic for ultimate failure
-                error: saleErrorMessage,
-                transactionId: transactionId,
-                saleId: saleId,
-                callbackData: callbackData,
-                airtimeApiResponse: airtimeDispatchResult,
-                providerAttempted: airtimeProviderUsed, // Log which provider was ultimately responsible for failure
-                createdAt: FieldValue.serverTimestamp(),
-            });
-            updateSaleFields.status = 'FAILED_DISPATCH_API';
-            updateSaleFields.errorMessage = saleErrorMessage;
-        }
-
-        await saleRef.update(updateSaleFields);
-        logger.info(`✅ Updated sale document ${saleId} with dispatch result.`);
-
-        // --- IMPORTANT NEW REVERSAL LOGIC STARTS HERE ---
-        if (airtimeDispatchStatus === 'FAILED') {
-            logger.warn(`🛑 Airtime dispatch ultimately failed for TransID ${transactionId}. Initiating Daraja reversal.`);
-
-            // Before attempting reversal, ensure we've updated the main transaction status to reflect failure
-            await transactionsCollection.doc(transactionId).update({
-                status: 'RECEIVED_FULFILLMENT_FAILED',
-                fulfillmentStatus: 'FAILED_DISPATCH_API',
-                fulfillmentDetails: airtimeDispatchResult,
-                errorMessage: saleErrorMessage,
-                lastUpdated: FieldValue.serverTimestamp(),
-                airtimeProviderUsed: airtimeProviderUsed,
-                reversalAttempted: true, // Mark that a reversal attempt is made
-            });
-
-            const reversalResult = await initiateDarajaReversal(transactionId, amount, mpesaNumber); 
-
-            if (reversalResult.success) {
-                logger.info(`✅ Daraja reversal initiated successfully for TransID ${transactionId}.`);
-                await reconciledTransactionsCollection.doc(transactionId).set({
-                    transactionId: transactionId,
-                    amount: amount,
-                    mpesaNumber: mpesaNumber,
-                    reversalInitiatedAt: FieldValue.serverTimestamp(),
-                    reversalRequestDetails: reversalResult.data,
-                    originalCallbackData: callbackData,
-                    status: 'REVERSAL_INITIATED', // Will be updated by M-Pesa's ResultURL callback
-                    createdAt: FieldValue.serverTimestamp(),
-                });
-                await transactionsCollection.doc(transactionId).update({
-                    status: 'REVERSAL_PENDING_CONFIRMATION',
-                    lastUpdated: FieldValue.serverTimestamp(),
-                    reversalDetails: reversalResult.data,
-                });
-            } else {
-                logger.error(`❌ Daraja reversal failed to initiate for TransID ${transactionId}: ${reversalResult.message}`);
-                await failedReconciliationsCollection.doc(transactionId).set({ 
-                    transactionId: transactionId,
-                    amount: amount,
-                    mpesaNumber: mpesaNumber,
-                    reversalAttemptedAt: FieldValue.serverTimestamp(),
-                    reversalFailureDetails: reversalResult.error,
-                    originalCallbackData: callbackData,
-                    reason: reversalResult.message,
-                    createdAt: FieldValue.serverTimestamp(),
-                }, { merge: true }); 
-                await transactionsCollection.doc(transactionId).update({
-                    status: 'REVERSAL_INITIATION_FAILED',
-                    lastUpdated: FieldValue.serverTimestamp(),
-                    reversalDetails: reversalResult.error,
-                    errorMessage: `Reversal initiation failed: ${reversalResult.message}`
-                });
-            }
-        } else {
-            // If airtime dispatch was COMPLETELY successful, update main transaction status
-            await transactionsCollection.doc(transactionId).update({
-                status: 'COMPLETED_AND_FULFILLED',
-                fulfillmentStatus: airtimeDispatchStatus,
-                fulfillmentDetails: airtimeDispatchResult,
-                lastUpdated: FieldValue.serverTimestamp(),
-                airtimeProviderUsed: airtimeProviderUsed,
-            });
-        }
-
-        logger.info(`Final status for TransID ${transactionId}: ${airtimeDispatchStatus === 'COMPLETED' ? 'COMPLETED_AND_FULFILLED' : 'REVERSAL_ATTEMPTED_OR_FAILED'}`);
-        res.json({ "ResultCode": 0, "ResultDesc": "C2B Confirmation and Airtime Dispatch Processed. Reversal initiated if failed." });
+        logger.info(`C2B Confirmation for TransID ${transactionId} completed. Fulfillment Result:`, fulfillmentResult);
+        res.json({ "ResultCode": 0, "ResultDesc": "C2B Confirmation and Airtime Dispatch Processed." });
 
     } catch (error) {
         logger.error(`❌ CRITICAL ERROR in C2B Confirmation for TransID ${transactionId}:`, {
