@@ -1585,7 +1585,6 @@ app.post('/api/fulfill-airtime', async (req, res) => {
     const now = FieldValue.serverTimestamp();
 
     logger.info('📦 Received fulfillment request from STK Server:', fulfillmentRequest);
-
     const {
         checkoutRequestID,
         merchantRequestID,
@@ -1595,7 +1594,7 @@ app.post('/api/fulfill-airtime', async (req, res) => {
         customerPhoneNumber,
         carrier
     } = fulfillmentRequest;
-
+    
     if (!checkoutRequestID || !amountPaid || !recipientNumber || !customerPhoneNumber || !carrier) {
         logger.error('❌ Missing required fields in fulfillment request:', fulfillmentRequest);
         await errorsCollection.add({
@@ -1606,150 +1605,8 @@ app.post('/api/fulfill-airtime', async (req, res) => {
         });
         return res.status(400).json({ success: false, message: 'Missing required fulfillment details.' });
     }
-
-    try {
-        // 1. Update the 'transactions' collection
-        const transactionDocRef = transactionsCollection.doc(checkoutRequestID);
-        const transactionDoc = await transactionDocRef.get();
-
-        if (!transactionDoc.exists) {
-            logger.warn(`⚠️ Transaction ${checkoutRequestID} not found in 'transactions' collection on offline server. Creating new record.`);
-            // Optionally create a new transaction record if it's truly missing,
-            // but ideally, the STK server should have created it.
-            await transactionDocRef.set({
-                transactionID: checkoutRequestID,
-                type: 'STK_PUSH_PAYMENT', // Assuming it's an STK Push payment
-                status: 'OFFLINE_FULFILLMENT_QUEUED', // New status
-                fulfillmentStatus: 'QUEUED_FOR_OFFLINE',
-                amountReceived: amountPaid,
-                payerMsisdn: customerPhoneNumber,
-                billRefNumber: recipientNumber,
-                carrier: carrier,
-                mpesaReceiptNumber: mpesaReceiptNumber,
-                mpesaCallbackData: fulfillmentRequest, // Store the notification payload
-                createdAt: now,
-                lastUpdated: now,
-                relatedSaleId: checkoutRequestID, // Link to the sales doc
-            }, { merge: true });
-        } else {
-            // Update existing transaction record
-            await transactionDocRef.update({
-                status: 'OFFLINE_FULFILLMENT_QUEUED', // Update status
-                fulfillmentStatus: 'QUEUED_FOR_OFFLINE',
-                lastUpdated: now,
-                // You might want to add a field like 'offlineServerReceivedAt: now'
-            });
-        }
-        logger.info(`✅ Transaction ${checkoutRequestID} status updated to OFFLINE_FULFILLMENT_QUEUED.`);
-
-        // 2. Update the 'sales' collection (which holds the initial request data for STK Push)
-        const salesDocRef = salesCollection.doc(checkoutRequestID);
-        const salesDoc = await salesDocRef.get();
-
-        if (!salesDoc.exists) {
-            logger.warn(`⚠️ Sales document ${checkoutRequestID} not found on offline server. Creating new record.`);
-            // This case should ideally not happen if STK server created it.
-            await salesDocRef.set({
-                saleId: checkoutRequestID,
-                relatedTransactionId: checkoutRequestID,
-                recipient: recipientNumber,
-                amount: amountPaid, // Amount paid by customer, fulfillment amount will be updated later
-                carrier: carrier,
-                mpesaPaymentStatus: 'SUCCESSFUL_PENDING_EXTERNAL_FULFILLMENT', // Status from STK server
-                offlineFulfillmentStatus: 'QUEUED_FOR_OFFLINE', // New status for offline server
-                createdAt: now,
-                lastUpdated: now,
-                type: 'STK_PUSH_REQUEST',
-            }, { merge: true });
-        } else {
-            await salesDocRef.update({
-                offlineFulfillmentStatus: 'QUEUED_FOR_OFFLINE', // New status for offline server
-                lastUpdated: now,
-            });
-        }
-        logger.info(`✅ Sales document ${checkoutRequestID} updated with OFFLINE_FULFILLMENT_QUEUED status.`);
-
-        // --- IMPORTANT: AIRTIME DISPATCH LOGIC GOES HERE (OR IS TRIGGERED SEPARATELY) ---
-        // As per your request, this endpoint will *not* immediately dispatch airtime.
-        // It merely queues the request.
-        //
-        // You would have a separate process (e.g., a cron job, a Firebase Cloud Function
-        // triggered by updates to 'transactions' or 'sales' where status is 'QUEUED_FOR_OFFLINE')
-        // that reads these queued transactions and performs the actual airtime dispatch.
-        //
-        // Example of what the separate process would do (pseudocode):
-        /*
-        // --- START PSEUDOCODE FOR SEPARATE OFFLINE FULFILLMENT PROCESS ---
-        async function runOfflineAirtimeDispatch() {
-            const transactionsToFulfill = await transactionsCollection
-                .where('status', '==', 'OFFLINE_FULFILLMENT_QUEUED')
-                .limit(50) // Process in batches
-                .get();
-
-            for (const doc of transactionsToFulfill.docs) {
-                const txData = doc.data();
-                logger.info(`Attempting offline airtime dispatch for ${txData.transactionID}`);
-
-                try {
-                    // Call your actual airtime dispatch logic here (e.g., processAirtimeFulfillment)
-                    // You'd need to pass the necessary data from txData
-                    const fulfillmentResult = await processAirtimeFulfillment({
-                        transactionId: txData.transactionID,
-                        originalAmountPaid: txData.amountReceived,
-                        payerMsisdn: txData.payerMsisdn,
-                        payerName: txData.payerName || null,
-                        topupNumber: txData.billRefNumber,
-                        sourceCallbackData: txData.mpesaCallbackData, // Pass the original M-Pesa callback
-                        requestType: txData.type === 'STK_PUSH_PAYMENT' ? 'STK_PUSH' : 'C2B', // Or derive from type
-                        relatedSaleId: txData.relatedSaleId,
-                    });
-
-                    if (fulfillmentResult.success) {
-                        logger.info(`✅ Offline dispatch COMPLETED for ${txData.transactionID}`);
-                        // The processAirtimeFulfillment function should handle updating
-                        // 'transactions' and 'sales' to 'COMPLETED_AND_FULFILLED'
-                    } else {
-                        logger.error(`❌ Offline dispatch FAILED for ${txData.transactionID}: ${fulfillmentResult.error}`);
-                        // The processAirtimeFulfillment function should handle updating
-                        // 'transactions' and 'sales' to 'RECEIVED_FULFILLMENT_FAILED' and initiating reversal
-                    }
-                } catch (dispatchError) {
-                    logger.error(`❌ Critical error in offline dispatch for ${txData.transactionID}:`, dispatchError);
-                    await transactionsCollection.doc(txData.transactionID).update({
-                        status: 'CRITICAL_OFFLINE_FULFILLMENT_ERROR',
-                        errorMessage: `Critical error in offline dispatch: ${dispatchError.message}`,
-                        lastUpdated: FieldValue.serverTimestamp(),
-                    });
-                }
-            }
-        }
-        // This function (runOfflineAirtimeDispatch) would be called by a cron job or a Cloud Function trigger.
-        // --- END PSEUDOCODE ---
-        */
-
-        // Respond to the STK server that the request was received and queued
-        return res.status(200).json({ success: true, message: 'Fulfillment request received and queued for offline processing.' });
-
-    } catch (error) {
-        logger.error(`❌ CRITICAL ERROR in offline server fulfillment endpoint for ${checkoutRequestID}:`, {
-            message: error.message,
-            stack: error.stack,
-            requestBody: fulfillmentRequest,
-        });
-
-        // Log this critical error to Firestore's errorsCollection
-        await errorsCollection.add({
-            type: 'OFFLINE_FULFILLMENT_ENDPOINT_CRITICAL_ERROR',
-            checkoutRequestID: checkoutRequestID,
-            error: error.message,
-            stack: error.stack,
-            requestBody: fulfillmentRequest,
-            createdAt: now,
-        });
-
         // Respond with an error to the STK server
         return res.status(500).json({ success: false, message: 'Internal server error during fulfillment request processing.' });
-    }
 });
 
 //Keep live tracker
