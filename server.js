@@ -382,7 +382,7 @@ async function sendSafaricomAirtime(receiverNumber, amount) {
             if (idMatch && idMatch[1]) {
                 safaricomInternalTransId = idMatch[1];
             }
-            const balanceMatch = desc.match(/New balance is Ksh\. (\d+\.\d{2})/); // Regex for the balance
+            const balanceMatch = desc.match(/New balance is Ksh\. (\d+(?:\.\d{2})?)/); // Regex for the balance
             if (balanceMatch && balanceMatch[1]) {
                 newSafaricomFloatBalance = parseFloat(balanceMatch[1]);
             }
