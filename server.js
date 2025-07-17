@@ -1418,6 +1418,11 @@ app.post('/api/airtime-bonuses/update', async (req, res) => {
     }
 });
 
+//Keep live tracker
+app.get("/ping", (req, res) => {
+  res.status(200).send("pong");
+});
+
 // Start the server
 app.listen(PORT, () => {
     logger.info(`Server running on port ${PORT}`);
