@@ -1133,7 +1133,7 @@ app.post('/c2b-validation', async (req, res) => {
 
     try {
         // ✅ Validate phone format
-        const phoneRegex = /^(\+254|254|0)(1|7)\d{8}$/;
+        const phoneRegex = /^(\+254|254|0)(1\d|7\d)\d{7}$/;
         if (!phoneRegex.test(BillRefNumber)) {
             throw {
                 code: 'C2B00012',
