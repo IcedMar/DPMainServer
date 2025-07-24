@@ -125,27 +125,7 @@ const ANALYTICS_SERVER_URL = process.env.ANALYTICS_SERVER_URL; // Your analytics
 // --- Middleware ---
 app.use(helmet());
 app.use(bodyParser.json({ limit: '1mb' }));
-// --- CORS Configuration ---
-// Allow specific origins (recommended for production)
-const allowedOrigins = [
-    'https://www.daimapay.com',
-    'https://daimapay-51406.web.app',
-  'https://daimapay.web,app'
-];
-app.use(cors({
-    origin: function (origin, callback) {
-        // allow requests with no origin (like mobile apps or curl requests)
-        if (!origin) return callback(null, true);
-        if (allowedOrigins.indexOf(origin) === -1) {
-            const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
-            return callback(new Error(msg), false);
-        }
-        return callback(null, true);
-    },
-    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE', // Allowed HTTP methods
-    credentials: true, // Allow cookies to be sent with requests (if needed)
-    optionsSuccessStatus: 204 // Some legacy browsers (IE11, various SmartTVs) choke on 200
-}));
+app.use(cors()); // Enable CORS for all routes
 
 const c2bLimiter = rateLimit({
     windowMs: 5 * 60 * 1000,
@@ -2234,3 +2214,16 @@ app.listen(PORT, () => {
     logger.info(`Server running on port ${PORT}`);
     console.log(`Server running on port ${PORT}`);
 });
+
+app.set('trust proxy', 1);
+
+function generateTimestamp() {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const MM = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const HH = String(now.getHours()).padStart(2, '0');
+  const mm = String(now.getMinutes()).padStart(2, '0');
+  const ss = String(now.getSeconds()).padStart(2, '0');
+  return `${yyyy}${MM}${dd}${HH}${mm}${ss}`;
+}
