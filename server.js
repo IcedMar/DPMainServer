@@ -9,6 +9,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const winston = require('winston');
+const nodemailer = require('nodemailer');
 require('winston-daily-rotate-file');
 
 // --- Global Error Handlers (VERY IMPORTANT FOR PRODUCTION) ---
@@ -103,8 +104,7 @@ const reconciledTransactionsCollection = firestore.collection('reconciled_transa
 const failedReconciliationsCollection = firestore.collection('failed_reconciliations');
 const reversalTimeoutsCollection = firestore.collection('reversal_timeouts'); // NEW: Initialize this collection
 const bonusHistoryCollection = firestore.collection('bonus_history'); // NEW: Initialize this collection
-
-// NEW: Firestore reference for dealer config (updated path)
+const stkTransactionsCollection = firestore.collection('stk_Transactions');
 const safaricomDealerConfigRef = firestore.collection('mpesa_settings').doc('main_config');
 
 // --- Africa's Talking Initialization ---
@@ -113,6 +113,14 @@ const africastalking = AfricasTalking({
     apiKey: process.env.AT_API_KEY,
     username: process.env.AT_USERNAME
 });
+
+// M-Pesa API Credentials from .env
+const CONSUMER_KEY = process.env.CONSUMER_KEY;
+const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
+const SHORTCODE = process.env.BUSINESS_SHORT_CODE; // Your Paybill/Till number
+const PASSKEY = process.env.PASSKEY;
+const STK_CALLBACK_URL = process.env.CALLBACK_URL; // Your public URL for /stk-callback
+const ANALYTICS_SERVER_URL = process.env.ANALYTICS_SERVER_URL; // Your analytics server URL
 
 // --- Middleware ---
 app.use(helmet());
@@ -184,6 +192,241 @@ async function getDarajaAccessToken() {
     }
 }
 
+//--BEGINING OF EMAIL FUNCTION --
+// Nodemailer setup
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER, // example: 10team.daimapay@gmail.com
+    pass: process.env.EMAIL_PASS, // use Gmail App Password
+  }
+});
+
+app.post('/api/send-login-email', async (req, res) => {
+  const { userEmail, userRole, timestamp } = req.body;
+
+  if (!userEmail || !userRole || !timestamp) {
+    return res.status(400).json({ error: 'All fields required' });
+  }
+    const mailOptions = {
+    from: `"Login Alert" <no-reply@daimapay.com>`,
+    to: 'team.daimapay@gmail.com',
+    subject: `New Login Detected`,
+    text: `User ${userEmail} logged in as ${userRole} at ${timestamp}`,
+    html: `<p><strong>Email:</strong> ${userEmail}</p><p><strong>Role:</strong> ${userRole}</p><p><strong>Time:</strong> ${timestamp}</p>`
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    res.status(200).json({ success: true, message: 'Email sent successfully' });
+  } catch (err) {
+    console.error('Email Error:', err);
+    res.status(500).json({ error: 'Failed to send email' });
+  }
+});
+//-- END OF EMAIL --
+
+//-- BEGINING OF ANALYTICS
+const formatDate = (date) => date.toISOString().split('T')[0];
+const getFloatCollectionId = (telco) => {
+  if (telco === 'Safaricom') return 'Saf_float';
+  if (['Airtel', 'Telkom', 'Africastalking'].includes(telco)) return 'AT_Float';
+  return null;
+};
+
+const getIndividualFloatBalance = async (floatType) => {
+  try {
+    const doc = await db.collection(floatType).doc('current').get();
+    return doc.exists ? doc.data().balance || 0 : 0;
+  } catch (err) {
+    console.error(`Error fetching ${floatType} float:`, err);
+    return 0;
+  }
+};
+
+// --- Time helpers ---
+const getStartOfDayEAT = (date) => {
+  const d = new Date(date);
+  d.setUTCHours(0, 0, 0, 0);
+  d.setUTCHours(d.getUTCHours() - 3);
+  return admin.firestore.Timestamp.fromDate(d);
+};
+const getEndOfDayEAT = (date) => {
+  const d = new Date(date);
+  d.setUTCHours(23, 59, 59, 999);
+  d.setUTCHours(d.getUTCHours() - 3);
+  return admin.firestore.Timestamp.fromDate(d);
+};
+const getStartOfMonthEAT = (date) => {
+  const d = new Date(date.getFullYear(), date.getMonth(), 1);
+  d.setUTCHours(0, 0, 0, 0);
+  d.setUTCHours(d.getUTCHours() - 3);
+  return admin.firestore.Timestamp.fromDate(d);
+};
+
+// --- Classic sum fallback ---
+async function sumSales(collectionRef) {
+  const snap = await collectionRef.get();
+  return snap.docs.reduce((sum, doc) => sum + (doc.data().amount || 0), 0);
+}
+
+// --- Main Sales Data Function ---
+const getSalesOverviewData = async () => {
+  const telcos = ['Safaricom', 'Airtel', 'Telkom'];
+  const sales = {};
+  const topPurchasers = {};
+    
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+
+  const startToday = getStartOfDayEAT(today);
+  const endToday = getEndOfDayEAT(today);
+  const startYesterday = getStartOfDayEAT(yesterday);
+  const endYesterday = getEndOfDayEAT(yesterday);
+  const startMonth = getStartOfMonthEAT(today);
+
+  for (const telco of telcos) {
+    // Today
+    const todayRef = db.collection('sales')
+      .where('status', 'in', ['COMPLETED', 'SUCCESS'])
+      .where('carrier', '==', telco)
+      .where('createdAt', '>=', startToday)
+      .where('createdAt', '<=', endToday);
+    const todayTotal = await sumSales(todayRef);
+      
+    // Yesterday
+    const yestRef = db.collection('sales')
+      .where('status', 'in', ['COMPLETED', 'SUCCESS'])
+      .where('carrier', '==', telco)
+      .where('createdAt', '>=', startYesterday)
+      .where('createdAt', '<=', endYesterday);
+    const yestTotal = await sumSales(yestRef);
+
+    // This month
+    const monthRef = db.collection('sales')
+      .where('status', 'in', ['COMPLETED', 'SUCCESS'])
+      .where('carrier', '==', telco)
+      .where('createdAt', '>=', startMonth);
+    const monthTotal = await sumSales(monthRef);
+
+    const trend = yestTotal === 0
+      ? (todayTotal > 0 ? 'up' : 'neutral')
+      : (todayTotal >= yestTotal ? 'up' : 'down');
+
+    sales[telco] = { today: todayTotal, month: monthTotal, trend };
+      // Top purchasers
+    const allRef = db.collection('sales')
+      .where('carrier', '==', telco)
+      .where('status', 'in', ['COMPLETED', 'SUCCESS']);
+    const allSnap = await allRef.get();
+    const buyers = {};
+    allSnap.forEach(doc => {
+      const { topupNumber, amount } = doc.data();
+      if (topupNumber) buyers[topupNumber] = (buyers[topupNumber] || 0) + (amount || 0);
+    });
+    const top = Object.entries(buyers)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([name, Amount]) => ({ name, Amount }));
+    topPurchasers[telco] = top;
+  }
+
+  return { sales, topPurchasers };
+};
+
+// --- Endpoints ---
+app.get('/api/analytics/sales-overview', async (req, res) => {
+  try {
+    const { sales } = await getSalesOverviewData();
+    res.json(sales);
+  } catch (err) {
+    console.error('Error:', err);
+    res.status(500).json({ error: 'Failed to load sales overview.' });
+  }
+});
+app.post('/api/process-airtime-purchase', async (req, res) => {
+  const { amount, status, telco, transactionId } = req.body;
+
+  if (!amount || !status || !telco || !transactionId) {
+    return res.status(400).json({ error: 'Missing fields.' });
+  }
+
+  if (!['COMPLETED', 'SUCCESS'].includes(status.toUpperCase())) {
+    return res.json({ ok: true, note: 'No float deduction needed.' });
+  }
+
+  const floatCollectionId = getFloatCollectionId(telco);
+  if (!floatCollectionId) {
+    return res.status(400).json({ error: 'Unknown telco.' });
+  }
+
+  const floatRef = db.collection(floatCollectionId).doc('current');
+    try {
+    await db.runTransaction(async (tx) => {
+      const doc = await tx.get(floatRef);
+      if (!doc.exists) throw new Error('Float doc missing.');
+      const current = doc.data().balance || 0;
+      const newBal = current - amount;
+      if (newBal < 0) throw new Error('Insufficient float.');
+      tx.update(floatRef, { balance: newBal });
+    });
+    res.json({ ok: true, note: 'Float deducted.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+app.get('/api/analytics/dashboard', async (req, res) => {
+  try {
+    const { sales, topPurchasers } = await getSalesOverviewData();
+    const saf = await getIndividualFloatBalance('Saf_float');
+    const at = await getIndividualFloatBalance('AT_Float');
+
+    const floatLogsSnap = await db.collection('floatLogs')
+      .orderBy('timestamp', 'desc')
+      .limit(50)
+      .get();
+
+    const floatLogs = floatLogsSnap.docs.map(doc => ({
+      date: formatDate(doc.data().timestamp?.toDate?.() || new Date()),
+      type: doc.data().type,
+      Amount: doc.data().Amount,
+      description: doc.data().description,
+    }));
+
+    res.json({
+      sales,
+      safFloatBalance: saf,
+      atFloatBalance: at,
+      floatBalance: saf + at,
+      floatLogs,
+      topPurchasers
+    });
+} catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to load dashboard.' });
+  }
+});
+   
+//--END OF ANALYTICS --
+
+// Function to get Daraja access token
+async function getAccessToken() {
+    const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString('base64');
+    try {
+        const response = await axios.get('https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
+            headers: {
+                'Authorization': `Basic ${auth}`
+            }
+        });
+        return response.data.access_token;
+    } catch (error) {
+        logger.error('Error getting access token:', error.message);
+        throw new Error('Failed to get M-Pesa access token.');
+    }
+}
+
 let cachedAirtimeToken = null;
 let tokenExpiryTimestamp = 0;
 
@@ -203,6 +446,12 @@ async function generateServicePin(rawPin) {
         logger.error('[generateServicePin] error:', error);
         throw new Error(`Service PIN generation failed: ${error.message}`);
     }
+}
+
+// Function to generate password for STK Push
+function generatePassword(shortcode, passkey, timestamp) {
+    const str = shortcode + passkey + timestamp;
+    return Buffer.from(str).toString('base64');
 }
 
 // NEW: Function to get dealer service PIN from Firestore with caching
@@ -532,6 +781,43 @@ function generateSecurityCredential(password) {
     }
 }
 
+// Helper function to notify the offline server (add this somewhere in your server.js)
+async function notifyOfflineServerForFulfillment(transactionDetails) {
+    try {
+        const offlineServerUrl = process.env.OFFLINE_SERVER_FULFILLMENT_URL;
+        if (!offlineServerUrl) {
+            logger.error('OFFLINE_SERVER_FULFILLMENT_URL is not set in environment variables. Cannot notify offline server.');
+            return { success: false, message: 'Offline server URL not configured.' };
+        }
+
+        // Send a POST request to your offline server
+        const response = await axios.post(offlineServerUrl, transactionDetails);
+
+        logger.info(`✅ Notified offline server for fulfillment of ${transactionDetails.checkoutRequestID}. Offline server response:`, response.data);
+        return { success: true, responseData: response.data };
+
+    } catch (error) {
+        logger.error(`❌ Failed to notify offline server for fulfillment of ${transactionDetails.checkoutRequestID}:`, {
+            message: error.message,
+            statusCode: error.response ? error.response.status : 'N/A',
+            responseData: error.response ? error.response.data : 'N/A',
+            stack: error.stack
+        });
+
+         // Log this critical error to Firestore's errorsCollection
+        await errorsCollection.add({
+            type: 'OFFLINE_SERVER_NOTIFICATION_FAILED',
+            checkoutRequestID: transactionDetails.checkoutRequestID,
+            error: error.message,
+            offlineServerResponse: error.response ? error.response.data : null,
+            payloadSent: transactionDetails,
+            createdAt: FieldValue.serverTimestamp(),
+        });
+
+        return { success: false, message: 'Failed to notify offline server.' };
+    }
+}
+
 // --- NEW: Daraja Reversal Function ---
 async function initiateDarajaReversal(transactionId, amount, receiverMsisdn) { 
     logger.info(`🔄 Attempting Daraja reversal for TransID: ${transactionId}, Amount: ${amount}`);
@@ -656,6 +942,315 @@ async function updateCarrierFloatBalance(carrierLogicalName, amount) {
         return { success: true, newBalance: newFloat };
     });
 }
+
+// ---STK Functions ---
+
+// --- RATE LIMITING ---
+const stkPushLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, // 1 minute
+    max: 20, // Limit each IP to 20 requests per window
+    message: 'Too many STK Push requests from this IP, please try again after a minute.',
+    statusCode: 429,
+    headers: true,
+});
+
+const stkCallbackRateLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, // 1 minute
+    max: 100, // M-Pesa can send multiple retries
+    message: 'Too many STK Callback requests, please try again later.',
+    statusCode: 429,
+    headers: true,
+});
+
+// 1. STK Push Initiation Endpoint
+app.post('/stk-push', stkPushLimiter, async (req, res) => {
+    const { amount, phoneNumber, recipient, customerName, serviceType, reference } = req.body; // Added customerName, serviceType, reference for completeness
+
+    if (!amount || !phoneNumber || !recipient) {
+        logger.warn('Missing required parameters for STK Push:', { amount, phoneNumber, recipient });
+        return res.status(400).json({ success: false, message: 'Missing required parameters: amount, phoneNumber, recipient.' });
+    }
+
+    const timestamp = generateTimestamp();
+    const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
+
+    logger.info(`Initiating STK Push for recipient: ${recipient}, amount: ${amount}, customer: ${phoneNumber}`);
+
+    // --- Input Validation (moved here for early exit) ---
+    const MIN_AMOUNT = 5;
+    const MAX_AMOUNT = 5000;
+    const amountFloat = parseFloat(amount);
+
+     if (isNaN(amountFloat) || amountFloat < MIN_AMOUNT || amountFloat > MAX_AMOUNT) {
+        logger.warn(`🛑 Invalid amount ${amount} for STK Push. Amount must be between ${MIN_AMOUNT} and ${MAX_AMOUNT}.`);
+        return res.status(400).json({ success: false, message: `Invalid amount. Must be between ${MIN_AMOUNT} and ${MAX_AMOUNT}.` });
+    }
+
+    const cleanedRecipient = recipient.replace(/\D/g, ''); // Ensure only digits
+    const cleanedCustomerPhone = phoneNumber.replace(/\D/g, ''); // Ensure only digits
+
+    if (!cleanedRecipient || !cleanedCustomerPhone || cleanedRecipient.length < 9 || cleanedCustomerPhone.length < 9) {
+        logger.warn(`🛑 Invalid recipient (${recipient}) or customer phone (${phoneNumber}) for STK Push.`);
+        return res.status(400).json({ success: false, message: "Invalid recipient or customer phone number format." });
+    }
+
+    const detectedCarrier = detectCarrier(cleanedRecipient); // Detect carrier at initiation
+    if (detectedCarrier === 'Unknown') {
+        logger.warn(`🛑 Unknown carrier for recipient ${cleanedRecipient}.`);
+        return res.status(400).json({ success: false, message: "Recipient's carrier is not supported." });
+    }
+
+    // Declare CheckoutRequestID here, it will be set after Daraja response
+    let CheckoutRequestID = null;
+
+    try {
+        const accessToken = await getAccessToken();
+
+        const stkPushPayload = {
+            BusinessShortCode: SHORTCODE,
+            Password: password,
+            Timestamp: timestamp,
+            TransactionType: 'CustomerPayBillOnline', // Or 'CustomerBuyGoodsOnline' if applicable
+            Amount: amountFloat, // Use the parsed float amount
+            PartyA: cleanedCustomerPhone, // Customer's phone number
+            PartyB: SHORTCODE, // Your Paybill/Till number
+            PhoneNumber: cleanedCustomerPhone, // Customer's phone number
+            CallBackURL: STK_CALLBACK_URL,
+            AccountReference: cleanedRecipient, // Use recipient number as account reference
+            TransactionDesc: `Airtime for ${cleanedRecipient}`
+        };
+
+        const stkPushResponse = await axios.post(
+            'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+            stkPushPayload,
+            {
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                     'Content-Type': 'application/json' // Explicitly set Content-Type
+                }
+            }
+        );
+
+        logger.info('STK Push Request Sent to Daraja:', stkPushResponse.data);
+
+        const {
+            ResponseCode,
+            ResponseDescription,
+            CustomerMessage,
+            CheckoutRequestID: darajaCheckoutRequestID, // Rename to avoid conflict with outer scope
+            MerchantRequestID
+        } = stkPushResponse.data;
+
+        // Assign Daraja's CheckoutRequestID to the outer scope variable
+        CheckoutRequestID = darajaCheckoutRequestID;
+
+        // ONLY create the stk_transaction document if M-Pesa successfully accepted the push request
+        if (ResponseCode === '0') {
+            await stkTransactionsCollection.doc(CheckoutRequestID).set({
+                checkoutRequestID: CheckoutRequestID,
+                merchantRequestID: MerchantRequestID, // Populate directly here
+                phoneNumber: cleanedCustomerPhone, // The number that received the STK Push
+                amount: amountFloat, // Use amountFloat for consistency
+                recipient: cleanedRecipient, // Crucial: Store the intended recipient here
+                carrier: detectedCarrier, // Assuming you detect carrier during initial request
+                initialRequestAt: FieldValue.serverTimestamp(),
+                stkPushStatus: 'PUSH_INITIATED', // Initial status
+                stkPushPayload: stkPushPayload, // Store the payload sent to Daraja
+                darajaResponse: stkPushResponse.data, // Store full Daraja response here
+                customerName: customerName || null,
+                serviceType: serviceType || 'airtime',
+                reference: reference || null,
+                lastUpdated: FieldValue.serverTimestamp(), // Add lastUpdated here too
+            });
+            logger.info(`✅ STK Transaction document ${CheckoutRequestID} created with STK Push initiation response.`);
+
+            return res.status(200).json({ success: true, message: CustomerMessage, checkoutRequestID: CheckoutRequestID });
+
+        } else {
+            // M-Pesa did not accept the push request (e.g., invalid number, insufficient balance in your shortcode)
+            logger.error('❌ STK Push Request Failed by Daraja:', stkPushResponse.data);
+            // Log this failure in errors collection
+            await errorsCollection.add({
+                type: 'STK_PUSH_INITIATION_FAILED_BY_DARJA',
+                error: ResponseDescription,
+                requestPayload: stkPushPayload,
+                mpesaResponse: stkPushResponse.data,
+                createdAt: FieldValue.serverTimestamp(),
+                checkoutRequestID: CheckoutRequestID, // Log this ID even if no record was created for it
+            });
+
+            // No stk_transaction document created if Daraja rejected the request
+            return res.status(500).json({ success: false, message: ResponseDescription || 'STK Push request failed.' });
+        }
+
+    } catch (error) {
+        logger.error('❌ Critical error during STK Push initiation:', {
+            message: error.message,
+            stack: error.stack,
+            requestBody: req.body,
+            responseError: error.response ? error.response.data : 'No response data'
+        });
+
+        const errorMessage = error.response ? (error.response.data.errorMessage || error.response.data.MpesaError || error.response.data) : error.message;
+
+        await errorsCollection.add({
+            type: 'STK_PUSH_CRITICAL_INITIATION_ERROR',
+            error: errorMessage,
+            requestBody: req.body,
+            stack: error.stack,
+            createdAt: FieldValue.serverTimestamp(),
+            checkoutRequestID: CheckoutRequestID || 'N/A', // Log the ID if available
+        });
+
+        res.status(500).json({ success: false, message: 'Failed to initiate STK Push.', error: errorMessage });
+    }
+}); 
+
+// Modified STK Callback Endpoint
+app.post('/stk-callback', async (req, res) => {
+    const callback = req.body;
+    logger.info('📞 Received STK Callback:', JSON.stringify(callback, null, 2)); // Log full callback for debugging
+
+    // Safaricom sends an empty object on initial push confirmation before payment
+    if (!callback || !callback.Body || !callback.Body.stkCallback) {
+        logger.warn('Received an empty or malformed STK callback. Ignoring.');
+        // Always respond with ResultCode 0 to M-Pesa to acknowledge receipt and prevent retries.
+        return res.json({ ResultCode: 0, ResultDesc: 'Callback processed (ignored empty/malformed).' });
+    }
+
+    const { MerchantRequestID, CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata } = callback.Body.stkCallback;
+
+    // Extracting relevant data from the callback
+    const amount = CallbackMetadata?.Item.find(item => item.Name === 'Amount')?.Value;
+    const mpesaReceiptNumber = CallbackMetadata?.Item.find(item => item.Name === 'MpesaReceiptNumber')?.Value;
+    const transactionDate = CallbackMetadata?.Item.find(item => item.Name === 'TransactionDate')?.Value;
+    const customerPhoneNumber = CallbackMetadata?.Item.find(item => item.Name === 'PhoneNumber')?.Value; // PartyA's phone
+
+    // --- Retrieve the STK transaction record ---
+    // This is the *only* collection the STK server should read/update now.
+    const stkTransactionDocRef = stkTransactionsCollection.doc(CheckoutRequestID);
+    const stkTransactionDoc = await stkTransactionDocRef.get();
+
+    if (!stkTransactionDoc.exists) {
+        logger.error(`❌ No matching STK transaction record for CheckoutRequestID (${CheckoutRequestID}) found in 'stk_transactions' collection.`);
+        // Respond with success to M-Pesa to prevent retries of this unknown callback,
+        // but log for manual investigation.
+        return res.json({ ResultCode: 0, ResultDesc: 'No matching STK transaction record found.' });
+    }
+        
+    const stkTransactionData = stkTransactionDoc.data();
+    // Get original recipient and carrier from the initial STK Push record
+    const originalRecipient = stkTransactionData.recipient;
+    const originalCarrier = stkTransactionData.carrier;
+    const originalAmountRequested = stkTransactionData.amount; // The amount initially requested for the push
+
+    // Prepare common update data for stk_transactions
+    const commonStkUpdateData = {
+        mpesaResultCode: ResultCode,
+        mpesaResultDesc: ResultDesc,
+        mpesaCallbackMetadata: CallbackMetadata, // Store full metadata
+        customerPhoneNumber: customerPhoneNumber, // From M-Pesa callback (PartyA)
+        lastUpdated: FieldValue.serverTimestamp(),
+    };
+
+    // Check M-Pesa ResultCode for success
+    if (ResultCode === 0) {
+        logger.info(`✅ M-Pesa payment successful for ${CheckoutRequestID}. Updating 'stk_transactions' and notifying offline server.`);
+
+        const successfulStkUpdateData = {
+            ...commonStkUpdateData,
+            mpesaPaymentStatus: 'SUCCESSFUL',
+             mpesaReceiptNumber: mpesaReceiptNumber,
+            mpesaTransactionDate: transactionDate,
+            amountConfirmed: amount, // Amount from M-Pesa callback
+            stkPushStatus: 'MPESA_PAYMENT_SUCCESS', // Final STK transaction status on STK server
+        };
+
+        try {
+            await stkTransactionDocRef.update(successfulStkUpdateData);
+            logger.info(`✅ STK transaction document ${CheckoutRequestID} updated with MPESA_PAYMENT_SUCCESS status.`);
+
+            // --- NOTIFY OFFLINE SERVER FOR FULFILLMENT ---
+            // This payload MUST contain ALL data the offline server needs to create
+            // its 'sales' and 'transactions' documents from scratch.
+            const fulfillmentDetails = {
+                checkoutRequestID: CheckoutRequestID,
+                merchantRequestID: MerchantRequestID,
+                mpesaReceiptNumber: mpesaReceiptNumber,
+                amountPaid: amount, // The actual amount confirmed by M-Pesa
+                recipientNumber: originalRecipient, // Retrieved from stk_transactions
+                customerPhoneNumber: customerPhoneNumber, // From M-Pesa callback
+                carrier: originalCarrier, // Retrieved from stk_transactions
+                transactionDate: transactionDate, // From M-Pesa callback
+                originalAmountRequested: originalAmountRequested, // From stk_transactions
+                stkPushInitiationPayload: stkTransactionData.stkPushPayload, // Full payload sent to Daraja
+                stkPushCallbackData: callback.Body.stkCallback,
+            };
+
+            const notificationResult = await notifyOfflineServerForFulfillment(fulfillmentDetails);
+
+            if (notificationResult.success) {
+                logger.info(`✅ Offline server successfully notified for fulfillment of ${CheckoutRequestID}.`);
+                // Update stk_transactions with notification status
+                await stkTransactionDocRef.update({
+                    offlineNotificationStatus: 'SUCCESS',
+                    lastUpdated: FieldValue.serverTimestamp(),
+                });
+            } else {
+                logger.error(`❌ Failed to notify offline server for ${CheckoutRequestID}. Manual intervention might be needed for fulfillment.`);
+                 // Update stk_transactions with notification failure status
+                await stkTransactionDocRef.update({
+                    offlineNotificationStatus: 'FAILED',
+                    offlineNotificationError: notificationResult.message,
+                    lastUpdated: FieldValue.serverTimestamp(),
+                });
+            }
+
+            // Always respond to M-Pesa with ResultCode 0 to acknowledge receipt of the callback.
+            return res.json({ ResultCode: 0, ResultDesc: 'Callback received and processing for external fulfillment initiated.' });
+
+        } catch (updateError) {
+            logger.error(`❌ Error updating 'stk_transactions' or notifying offline server for ${CheckoutRequestID}:`, { message: updateError.message, stack: updateError.stack });
+            await errorsCollection.add({
+                type: 'STK_CALLBACK_UPDATE_OR_NOTIFICATION_ERROR',
+                checkoutRequestID: CheckoutRequestID,
+                error: updateError.message,
+                stack: updateError.stack,
+                callbackData: callback,
+                createdAt: FieldValue.serverTimestamp(),
+            });
+            // Still respond success to M-Pesa to prevent retries (you'll handle the error internally)
+            return res.json({ ResultCode: 0, ResultDesc: 'Callback processed with internal error during update/notification.' });
+        }
+
+    } else {
+        // M-Pesa payment failed or was cancelled by user
+        logger.warn(`⚠️ M-Pesa payment failed or cancelled for ${CheckoutRequestID}. ResultCode: ${ResultCode}, ResultDesc: ${ResultDesc}`);
+        const failedStkUpdateData = {
+            ...commonStkUpdateData,
+            mpesaPaymentStatus: 'FAILED_OR_CANCELLED',
+            stkPushStatus: 'MPESA_PAYMENT_FAILED', // Final STK transaction status on STK server
+        };
+
+        try {
+            // Update only the stk_transactions document for failed/cancelled payments
+            await stkTransactionDocRef.update(failedStkUpdateData);
+            logger.info(`✅ STK transaction document updated for failed/cancelled payment for ${CheckoutRequestID}.`);
+        } catch (error) {
+            logger.error(`❌ Error updating 'stk_transactions' for failed/cancelled STK payment ${CheckoutRequestID}:`, { message: error.message, stack: error.stack });
+            await errorsCollection.add({
+                type: 'STK_CALLBACK_FAILED_PAYMENT_UPDATE_ERROR',
+                checkoutRequestID: CheckoutRequestID,
+                error: error.message,
+                stack: error.stack,
+                callbackData: callback,
+                createdAt: FieldValue.serverTimestamp(),
+            });
+        }
+        // Always respond with ResultCode 0 to M-Pesa even for failed payments, to acknowledge receipt of the callback.
+        return res.json({ ResultCode: 0, ResultDesc: 'Payment failed/cancelled. Callback processed.' });
+    }
+});
 
 // --- C2B (Offline Paybill) Callbacks ---
 /**
