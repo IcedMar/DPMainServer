@@ -125,7 +125,27 @@ const ANALYTICS_SERVER_URL = process.env.ANALYTICS_SERVER_URL; // Your analytics
 // --- Middleware ---
 app.use(helmet());
 app.use(bodyParser.json({ limit: '1mb' }));
-app.use(cors()); // Enable CORS for all routes
+// --- CORS Configuration ---
+// Allow specific origins (recommended for production)
+const allowedOrigins = [
+    'https://www.daimapay.com',
+    'https://daimapay-51406.web.app',
+  'https://daimapay.web,app'
+];
+app.use(cors({
+    origin: function (origin, callback) {
+        // allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.indexOf(origin) === -1) {
+            const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+            return callback(new Error(msg), false);
+        }
+        return callback(null, true);
+    },
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE', // Allowed HTTP methods
+    credentials: true, // Allow cookies to be sent with requests (if needed)
+    optionsSuccessStatus: 204 // Some legacy browsers (IE11, various SmartTVs) choke on 200
+}));
 
 const c2bLimiter = rateLimit({
     windowMs: 5 * 60 * 1000,
