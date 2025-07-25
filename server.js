@@ -308,7 +308,7 @@ const getSalesOverviewData = async () => {
 
   for (const telco of telcos) {
     // Today
-    const todayRef = db.collection('sales')
+    const todayRef = firestore.collection('sales')
       .where('status', 'in', ['COMPLETED', 'SUCCESS'])
       .where('carrier', '==', telco)
       .where('createdAt', '>=', startToday)
@@ -316,7 +316,7 @@ const getSalesOverviewData = async () => {
     const todayTotal = await sumSales(todayRef);
       
     // Yesterday
-    const yestRef = db.collection('sales')
+    const yestRef = firestore.collection('sales')
       .where('status', 'in', ['COMPLETED', 'SUCCESS'])
       .where('carrier', '==', telco)
       .where('createdAt', '>=', startYesterday)
@@ -324,7 +324,7 @@ const getSalesOverviewData = async () => {
     const yestTotal = await sumSales(yestRef);
 
     // This month
-    const monthRef = db.collection('sales')
+    const monthRef = firestore.collection('sales')
       .where('status', 'in', ['COMPLETED', 'SUCCESS'])
       .where('carrier', '==', telco)
       .where('createdAt', '>=', startMonth);
@@ -336,7 +336,7 @@ const getSalesOverviewData = async () => {
 
     sales[telco] = { today: todayTotal, month: monthTotal, trend };
       // Top purchasers
-    const allRef = db.collection('sales')
+    const allRef = firestore.collection('sales')
       .where('carrier', '==', telco)
       .where('status', 'in', ['COMPLETED', 'SUCCESS']);
     const allSnap = await allRef.get();
@@ -381,9 +381,9 @@ app.post('/api/process-airtime-purchase', async (req, res) => {
     return res.status(400).json({ error: 'Unknown telco.' });
   }
 
-  const floatRef = db.collection(floatCollectionId).doc('current');
+  const floatRef = firestore.collection(floatCollectionId).doc('current');
     try {
-    await db.runTransaction(async (tx) => {
+    await firestore.runTransaction(async (tx) => {
       const doc = await tx.get(floatRef);
       if (!doc.exists) throw new Error('Float doc missing.');
       const current = doc.data().balance || 0;
@@ -403,7 +403,7 @@ app.get('/api/analytics/dashboard', async (req, res) => {
     const saf = await getIndividualFloatBalance('Saf_float');
     const at = await getIndividualFloatBalance('AT_Float');
 
-    const floatLogsSnap = await db.collection('floatLogs')
+    const floatLogsSnap = await firestore.collection('floatLogs')
       .orderBy('timestamp', 'desc')
       .limit(50)
       .get();
