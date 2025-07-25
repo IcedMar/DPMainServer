@@ -2337,6 +2337,31 @@ app.post('/api/bulk-airtime', async (req, res) => {
     return res.status(400).json({ error: 'totalAmount does not match sum of request amounts.' });
   }
 
+  // Deduct wallet balance before sending airtime
+  try {
+    const userRef = firestore.collection('users').doc(userId);
+    let userData;
+    await firestore.runTransaction(async (tx) => {
+      const userDoc = await tx.get(userRef);
+      if (!userDoc.exists) {
+        throw new Error('User not found.');
+      }
+      userData = userDoc.data();
+      const currentBalance = userData.walletBalance || 0;
+      if (currentBalance < totalAmount) {
+        throw new Error('Insufficient wallet balance.');
+      }
+      tx.update(userRef, {
+        walletBalance: FieldValue.increment(-totalAmount),
+        lastWalletUpdate: FieldValue.serverTimestamp()
+      });
+    });
+    // If transaction succeeds, proceed to send airtime
+  } catch (err) {
+    console.error('Bulk airtime wallet deduction error:', err);
+    return res.status(400).json({ error: err.message || 'Failed to deduct wallet balance.' });
+  }
+
   const results = [];
   for (let i = 0; i < requests.length; i++) {
     const { phoneNumber, amount, telco, name } = requests[i];
@@ -2345,7 +2370,6 @@ app.post('/api/bulk-airtime', async (req, res) => {
     let dispatchResult = null;
     try {
       // Use your existing logic for sending airtime (carrier detection, fallback, float management, etc.)
-      // For this example, we'll use sendSafaricomAirtime/sendAfricasTalkingAirtime based on telco
       let result;
       if (telco && telco.toLowerCase() === 'safaricom') {
         result = await sendSafaricomAirtime(phoneNumber, amount);
