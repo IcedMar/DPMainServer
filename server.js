@@ -217,8 +217,8 @@ async function getDarajaAccessToken() {
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
-    user: process.env.EMAIL_USER, // example: 10team.daimapay@gmail.com
-    pass: process.env.EMAIL_PASS, // use Gmail App Password
+    user: process.env.EMAIL_USER, 
+    pass: process.env.EMAIL_PASS, 
   }
 });
 
@@ -269,19 +269,19 @@ const getStartOfDayEAT = (date) => {
   const d = new Date(date);
   d.setUTCHours(0, 0, 0, 0);
   d.setUTCHours(d.getUTCHours() - 3);
-  return admin.firestore.Timestamp.fromDate(d);
+  return Firestore.Timestamp.fromDate(d);
 };
 const getEndOfDayEAT = (date) => {
   const d = new Date(date);
   d.setUTCHours(23, 59, 59, 999);
   d.setUTCHours(d.getUTCHours() - 3);
-  return admin.firestore.Timestamp.fromDate(d);
+  return Firestore.Timestamp.fromDate(d);
 };
 const getStartOfMonthEAT = (date) => {
   const d = new Date(date.getFullYear(), date.getMonth(), 1);
   d.setUTCHours(0, 0, 0, 0);
   d.setUTCHours(d.getUTCHours() - 3);
-  return admin.firestore.Timestamp.fromDate(d);
+  return Firestore.Timestamp.fromDate(d);
 };
 
 // --- Classic sum fallback ---
