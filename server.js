@@ -244,6 +244,48 @@ app.post('/api/send-login-email', async (req, res) => {
     res.status(500).json({ error: 'Failed to send email' });
   }
 });
+
+app.post('/api/notify-float-balance', async (req, res) => {
+  const { to, floatBalance, threshold, telco } = req.body;
+
+  // Input validation
+  if (!to || !floatBalance || !telco) {
+    return res.status(400).json({ error: 'Missing required fields.' });
+  }
+
+  // Configure nodemailer transporter
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: process.env.EMAIL_USER, // Your Gmail address
+      pass: process.env.EMAIL_PASS, // App password or real password (use app password for Gmail)
+    },
+  });
+
+  // Email content
+  const mailOptions = {
+    from: `"DaimaPay Alerts" <${process.env.EMAIL_USER}>`,
+    to,
+    subject: `Float Balance Alert: ${telco}`,
+    html: `
+      <h2>Float Balance Notification</h2>
+      <p><strong>Telco:</strong> ${telco}</p>
+      <p><strong>Current Float Balance:</strong> Ksh ${Number(floatBalance).toLocaleString()}</p>
+      ${threshold ? `<p><strong>Threshold:</strong> Ksh ${Number(threshold).toLocaleString()}</p>` : ''}
+      <p>Please take necessary action if the balance is below the threshold.</p>
+      <hr>
+      <small>This is an automated message from DaimaPay.</small>
+    `,
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    res.json({ success: true, message: 'Email sent successfully.' });
+  } catch (err) {
+    console.error('Email send error:', err);
+    res.status(500).json({ error: 'Failed to send email notification.' });
+  }
+});
 //-- END OF EMAIL --
 
 //-- BEGINING OF ANALYTICS
@@ -1739,6 +1781,9 @@ async function processAirtimeFulfillment({
 
 
 // C2B Validation Endpoint
+// ... existing code ...
+
+// C2B Validation Endpoint
 app.post('/c2b-validation', async (req, res) => {
     const callbackData = req.body;
     const now = new Date();
@@ -1747,9 +1792,19 @@ app.post('/c2b-validation', async (req, res) => {
     const amount = parseFloat(TransAmount);
 
     try {
-        // ✅ Validate phone format
+        // ✅ Validate phone format or account number
         const phoneRegex = /^(\+254|254|0)(1\d|7\d)\d{7}$/;
-        if (!phoneRegex.test(BillRefNumber)) {
+        const isPhone = phoneRegex.test(BillRefNumber);
+        let isAccountNumber = false;
+        if (!isPhone) {
+            // Check if BillRefNumber matches a registered user's account number
+            const userSnap = await firestore.collection('users')
+                .where('accountNumber', '==', BillRefNumber)
+                .limit(1)
+                .get();
+            isAccountNumber = !userSnap.empty;
+        }
+        if (!isPhone && !isAccountNumber) {
             throw {
                 code: 'C2B00012',
                 desc: `Invalid BillRefNumber format: ${BillRefNumber}`,
@@ -1757,19 +1812,22 @@ app.post('/c2b-validation', async (req, res) => {
             };
         }
 
-        // ✅ Detect carrier
-        const carrier = detectCarrier(BillRefNumber);
-        if (carrier === 'Unknown') {
-            throw {
-                code: 'C2B00011',
-                desc: `Could not detect carrier from BillRefNumber: ${BillRefNumber}`,
-                subType: 'CARRIER_UNKNOWN'
-            };
+        // ✅ Detect carrier (only if phone)
+        let carrier = 'Unknown';
+        if (isPhone) {
+            carrier = detectCarrier(BillRefNumber);
+            if (carrier === 'Unknown') {
+                throw {
+                    code: 'C2B00011',
+                    desc: `Could not detect carrier from BillRefNumber: ${BillRefNumber}`,
+                    subType: 'CARRIER_UNKNOWN'
+                };
+            }
         }
 
         // ✅ Fetch settings from Firestore in parallel
         const [carrierDoc, systemDoc] = await Promise.all([
-            firestore.collection('carrier_settings').doc(carrier.toLowerCase()).get(),
+            isPhone ? firestore.collection('carrier_settings').doc(carrier.toLowerCase()).get() : Promise.resolve({ exists: true, data: () => ({ active: true }) }),
             firestore.collection('system_settings').doc('global').get(),
         ]);
 
@@ -1783,9 +1841,9 @@ app.post('/c2b-validation', async (req, res) => {
             };
         }
 
-        // ✅ Check if carrier is active
-        const carrierActive = carrierDoc.exists ? carrierDoc.data().active : false;
-        if (!carrierActive) {
+        // ✅ Check if carrier is active (only if phone)
+        const carrierActive = isPhone ? (carrierDoc.exists ? carrierDoc.data().active : false) : true;
+        if (isPhone && !carrierActive) {
             throw {
                 code: 'C2B00011',
                 desc: `${carrier} is currently inactive`,
@@ -1823,6 +1881,7 @@ app.post('/c2b-validation', async (req, res) => {
         });
     }
 });
+
 
 // C2B Confirmation Endpoint (Mandatory)
 app.post('/c2b-confirmation', async (req, res) => {
@@ -2247,3 +2306,277 @@ function generateTimestamp() {
   const ss = String(now.getSeconds()).padStart(2, '0');
   return `${yyyy}${MM}${dd}${HH}${mm}${ss}`;
 }
+
+// --- BULK AIRTIME ENDPOINT ---
+app.post('/api/bulk-airtime', async (req, res) => {
+  const { requests, totalAmount, userId } = req.body;
+  if (!Array.isArray(requests) || requests.length === 0 || !totalAmount || !userId) {
+    return res.status(400).json({ error: 'Missing required fields.' });
+  }
+
+  // Validate totalAmount matches sum of all amounts
+  const sumAmounts = requests.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+  if (Number(totalAmount) !== sumAmounts) {
+    return res.status(400).json({ error: 'totalAmount does not match sum of request amounts.' });
+  }
+
+  const results = [];
+  for (let i = 0; i < requests.length; i++) {
+    const { phoneNumber, amount, telco, name } = requests[i];
+    let status = 'FAILED';
+    let message = '';
+    let dispatchResult = null;
+    try {
+      // Use your existing logic for sending airtime (carrier detection, fallback, float management, etc.)
+      // For this example, we'll use sendSafaricomAirtime/sendAfricasTalkingAirtime based on telco
+      let result;
+      if (telco && telco.toLowerCase() === 'safaricom') {
+        result = await sendSafaricomAirtime(phoneNumber, amount);
+        if (result && result.status === 'SUCCESS') {
+          status = 'SUCCESS';
+          message = 'Airtime sent via Safaricom';
+        } else {
+          // Fallback to Africa's Talking
+          result = await sendAfricasTalkingAirtime(phoneNumber, amount, telco);
+          if (result && result.status === 'SUCCESS') {
+            status = 'SUCCESS';
+            message = 'Airtime sent via Africa\'s Talking fallback';
+          } else {
+            message = result && result.message ? result.message : 'Both Safaricom and fallback failed';
+          }
+        }
+      } else {
+        // Non-Safaricom: use Africa's Talking
+        result = await sendAfricasTalkingAirtime(phoneNumber, amount, telco);
+        if (result && result.status === 'SUCCESS') {
+          status = 'SUCCESS';
+          message = 'Airtime sent via Africa\'s Talking';
+        } else {
+          message = result && result.message ? result.message : 'Africa\'s Talking failed';
+        }
+      }
+      dispatchResult = result;
+    } catch (err) {
+      message = err.message || 'Exception during airtime dispatch';
+    }
+
+    // Log each attempt in Firestore
+    try {
+      await firestore.collection('bulk_airtime_logs').add({
+        userId,
+        phoneNumber,
+        amount,
+        telco,
+        name,
+        status,
+        message,
+        dispatchResult,
+        requestedAt: FieldValue.serverTimestamp(),
+        requestIndex: i,
+      });
+    } catch (logErr) {
+      console.error('Failed to log bulk airtime attempt:', logErr);
+    }
+
+    results.push({ phoneNumber, amount, telco, name, status, message });
+    // Wait 3 seconds before next
+    if (i < requests.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+  }
+
+  res.json({ results });
+});
+
+// --- BULK AIRTIME QUEUE ENDPOINTS ---
+// 1. Submit a bulk airtime job
+app.post('/api/bulk-airtime', async (req, res) => {
+  const { requests, totalAmount, userId } = req.body;
+  if (!Array.isArray(requests) || requests.length === 0 || !totalAmount || !userId) {
+    return res.status(400).json({ error: 'Missing required fields.' });
+  }
+  // Validate totalAmount matches sum of all amounts
+  const sumAmounts = requests.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+  if (Number(totalAmount) !== sumAmounts) {
+    return res.status(400).json({ error: 'totalAmount does not match sum of request amounts.' });
+  }
+  try {
+    const jobDoc = await firestore.collection('bulk_airtime_jobs').add({
+      userId,
+      requests,
+      totalAmount,
+      status: 'pending',
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+      results: [],
+      currentIndex: 0
+    });
+    res.json({ jobId: jobDoc.id });
+  } catch (err) {
+    console.error('Failed to create bulk airtime job:', err);
+    res.status(500).json({ error: 'Failed to create job.' });
+  }
+});
+
+// 2. Poll job status/results
+app.get('/api/bulk-airtime-status/:jobId', async (req, res) => {
+  const { jobId } = req.params;
+  try {
+    const jobDoc = await firestore.collection('bulk_airtime_jobs').doc(jobId).get();
+    if (!jobDoc.exists) {
+      return res.status(404).json({ error: 'Job not found.' });
+    }
+    res.json(jobDoc.data());
+  } catch (err) {
+    console.error('Failed to fetch bulk airtime job:', err);
+    res.status(500).json({ error: 'Failed to fetch job.' });
+  }
+});
+
+// 3. Background worker to process jobs
+const BULK_AIRTIME_WORKER_INTERVAL = 10000; // 10 seconds
+const BULK_AIRTIME_RECIPIENT_DELAY = 3000; // 3 seconds
+
+async function processBulkAirtimeJobs() {
+  try {
+    // Get jobs with status 'pending' or 'processing'
+    const jobsSnap = await firestore.collection('bulk_airtime_jobs')
+      .where('status', 'in', ['pending', 'processing'])
+      .orderBy('createdAt')
+      .limit(2) // process up to 2 jobs at a time
+      .get();
+    for (const jobDoc of jobsSnap.docs) {
+      const job = jobDoc.data();
+      const jobId = jobDoc.id;
+      let { requests, results = [], currentIndex = 0, status } = job;
+      if (!Array.isArray(requests) || currentIndex >= requests.length) {
+        // Already done
+        await firestore.collection('bulk_airtime_jobs').doc(jobId).update({
+          status: 'completed',
+          updatedAt: FieldValue.serverTimestamp()
+        });
+        continue;
+      }
+      // Mark as processing
+      if (status !== 'processing') {
+        await firestore.collection('bulk_airtime_jobs').doc(jobId).update({
+          status: 'processing',
+          updatedAt: FieldValue.serverTimestamp()
+        });
+      }
+      // Process up to 5 recipients per run (to avoid long locks)
+      let processed = 0;
+      while (currentIndex < requests.length && processed < 5) {
+        const { phoneNumber, amount, telco, name } = requests[currentIndex];
+        let recipientStatus = 'FAILED';
+        let message = '';
+        let dispatchResult = null;
+        try {
+          let result;
+          if (telco && telco.toLowerCase() === 'safaricom') {
+            result = await sendSafaricomAirtime(phoneNumber, amount);
+            if (result && result.status === 'SUCCESS') {
+              recipientStatus = 'SUCCESS';
+              message = 'Airtime sent via Safaricom';
+            } else {
+              // Fallback to Africa's Talking
+              result = await sendAfricasTalkingAirtime(phoneNumber, amount, telco);
+              if (result && result.status === 'SUCCESS') {
+                recipientStatus = 'SUCCESS';
+                message = 'Airtime sent via Africa\'s Talking fallback';
+              } else {
+                message = result && result.message ? result.message : 'Both Safaricom and fallback failed';
+              }
+            }
+          } else {
+            result = await sendAfricasTalkingAirtime(phoneNumber, amount, telco);
+            if (result && result.status === 'SUCCESS') {
+              recipientStatus = 'SUCCESS';
+              message = 'Airtime sent via Africa\'s Talking';
+            } else {
+              message = result && result.message ? result.message : 'Africa\'s Talking failed';
+            }
+          }
+          dispatchResult = result;
+        } catch (err) {
+          message = err.message || 'Exception during airtime dispatch';
+        }
+        results[currentIndex] = { phoneNumber, amount, telco, name, status: recipientStatus, message };
+        // Update job after each recipient
+        await firestore.collection('bulk_airtime_jobs').doc(jobId).update({
+          results,
+          currentIndex: currentIndex + 1,
+          updatedAt: FieldValue.serverTimestamp()
+        });
+        currentIndex++;
+        processed++;
+        // Wait 3 seconds before next recipient
+        if (currentIndex < requests.length) {
+          await new Promise(resolve => setTimeout(resolve, BULK_AIRTIME_RECIPIENT_DELAY));
+        }
+      }
+      // If all done, mark as completed
+      if (currentIndex >= requests.length) {
+        await firestore.collection('bulk_airtime_jobs').doc(jobId).update({
+          status: 'completed',
+          updatedAt: FieldValue.serverTimestamp()
+        });
+      }
+    }
+  } catch (err) {
+    console.error('Bulk airtime worker error:', err);
+  }
+}
+setInterval(processBulkAirtimeJobs, BULK_AIRTIME_WORKER_INTERVAL);
+// --- END BULK AIRTIME QUEUE ENDPOINTS ---
+
+// --- STK PUSH INITIATION ENDPOINT ---
+app.post('/api/mpesa/stkpush', async (req, res) => {
+  const { amount, phoneNumber, accountNumber } = req.body;
+  if (!amount || !phoneNumber || !accountNumber) {
+    return res.status(400).json({ error: 'Missing required fields.' });
+  }
+
+  try {
+    // Use existing timestamp and password generation functions/variables
+    const timestamp = generateTimestamp();
+    const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
+    // Use existing token function (getAccessToken or getDarajaAccessToken)
+    const token = await getAccessToken();
+
+    const payload = {
+      BusinessShortCode: SHORTCODE,
+      Password: password,
+      Timestamp: timestamp,
+      TransactionType: 'CustomerPayBillOnline',
+      Amount: Number(amount),
+      PartyA: phoneNumber,
+      PartyB: SHORTCODE,
+      PhoneNumber: phoneNumber,
+      CallBackURL: STK_CALLBACK_URL,
+      AccountReference: accountNumber,
+      TransactionDesc: 'Wallet Top Up'
+    };
+
+    const stkRes = await axios.post(
+      'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    res.json({
+      message: 'STK Push initiated. Await callback for confirmation.',
+      merchantRequestID: stkRes.data.MerchantRequestID,
+      checkoutRequestID: stkRes.data.CheckoutRequestID,
+      responseDescription: stkRes.data.ResponseDescription
+    });
+  } catch (err) {
+    console.error('STK Push error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to initiate STK Push.' });
+  }
+});
