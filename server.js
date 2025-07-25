@@ -1901,7 +1901,6 @@ app.post('/c2b-confirmation', async (req, res) => {
         LastName,
     } = callbackData;
 
-    const topupNumber = BillRefNumber.replace(/\D/g, '');
     const amount = parseFloat(TransAmount); // This is the original amount paid by customer
     const mpesaNumber = MSISDN;
     const customerName = `${FirstName || ''} ${MiddleName || ''} ${LastName || ''}`.trim();
@@ -1914,6 +1913,54 @@ app.post('/c2b-confirmation', async (req, res) => {
             return res.json({ "ResultCode": 0, "ResultDesc": "Duplicate C2B confirmation received and ignored." });
         }
 
+        // Check if BillRefNumber is a phone number or account number
+        const phoneRegex = /^(\+254|254|0)(1\d|7\d)\d{7}$/;
+        const isPhone = phoneRegex.test(BillRefNumber);
+        let topupNumber = BillRefNumber;
+        let walletUpdateResult = null;
+        let bonusApplied = 0;
+        let bonusPercentage = 0;
+        if (!isPhone) {
+            // It's an account number: update walletBalance in users collection
+            const userSnap = await firestore.collection('users')
+                .where('accountNumber', '==', BillRefNumber)
+                .limit(1)
+                .get();
+            if (!userSnap.empty) {
+                const userDoc = userSnap.docs[0];
+                const userRef = userDoc.ref;
+                // Fetch bonus percentage (global or per-user)
+                // Example: global bonus
+                const bonusDoc = await firestore.collection('wallet_bonuses').doc('current_settings').get();
+                if (bonusDoc.exists) {
+                    bonusPercentage = bonusDoc.data().percentage || 0;
+                }
+                // Example: per-user override
+                if (userDoc.data().walletBonusPercentage !== undefined) {
+                    bonusPercentage = userDoc.data().walletBonusPercentage;
+                }
+                bonusApplied = amount * (bonusPercentage / 100);
+                const totalToAdd = amount + bonusApplied;
+                await userRef.update({
+                    walletBalance: FieldValue.increment(totalToAdd),
+                    lastWalletUpdate: now
+                });
+                walletUpdateResult = {
+                    userId: userDoc.id,
+                    accountNumber: BillRefNumber,
+                    incrementedBy: totalToAdd,
+                    bonusApplied,
+                    bonusPercentage
+                };
+                logger.info(`✅ Updated walletBalance for user ${userDoc.id} (accountNumber: ${BillRefNumber}) by Ksh ${totalToAdd} (bonus: ${bonusApplied})`);
+            } else {
+                logger.warn(`⚠️ No user found with accountNumber: ${BillRefNumber} for wallet update.`);
+            }
+        } else {
+            // If phone, remove non-digits for topupNumber
+            topupNumber = BillRefNumber.replace(/\D/g, '');
+        }
+
         await transactionsCollection.doc(transactionId).set({
             transactionID: transactionId,
             type: 'C2B_PAYMENT', // Explicitly mark type
@@ -1921,29 +1968,34 @@ app.post('/c2b-confirmation', async (req, res) => {
             amountReceived: amount, // Original amount paid by customer
             payerMsisdn: mpesaNumber,
             payerName: customerName,
-            billRefNumber: topupNumber,
+            billRefNumber: BillRefNumber,
             mpesaRawCallback: callbackData,
             status: 'RECEIVED_PENDING_FULFILLMENT', // Set status to pending fulfillment
             fulfillmentStatus: 'PENDING', // Initial fulfillment status
             createdAt: now,
             lastUpdated: now,
+            walletUpdateResult: walletUpdateResult || null,
+            walletBonusApplied: bonusApplied,
+            walletBonusPercentage: bonusPercentage
         });
         logger.info(`✅ Recorded incoming transaction ${transactionId} in 'transactions' collection.`);
 
-        // --- 2. Trigger the unified airtime fulfillment process ---
-        const fulfillmentResult = await processAirtimeFulfillment({
-            transactionId: transactionId,
-            originalAmountPaid: amount,
-            payerMsisdn: mpesaNumber,
-            payerName: customerName,
-            topupNumber: topupNumber,
-            sourceCallbackData: callbackData,
-            requestType: 'C2B',
-            // relatedSaleId is null here as C2B creates its own sale doc
-        });
+        // --- 2. Trigger the unified airtime fulfillment process only if phone number ---
+        if (isPhone) {
+            const fulfillmentResult = await processAirtimeFulfillment({
+                transactionId: transactionId,
+                originalAmountPaid: amount,
+                payerMsisdn: mpesaNumber,
+                payerName: customerName,
+                topupNumber: topupNumber,
+                sourceCallbackData: callbackData,
+                requestType: 'C2B',
+                // relatedSaleId is null here as C2B creates its own sale doc
+            });
+            logger.info(`C2B Confirmation for TransID ${transactionId} completed. Fulfillment Result:`, fulfillmentResult);
+        }
 
-        logger.info(`C2B Confirmation for TransID ${transactionId} completed. Fulfillment Result:`, fulfillmentResult);
-        res.json({ "ResultCode": 0, "ResultDesc": "C2B Confirmation and Airtime Dispatch Processed." });
+        res.json({ "ResultCode": 0, "ResultDesc": "C2B Confirmation and Processing Complete." });
 
     } catch (error) {
         logger.error(`❌ CRITICAL ERROR in C2B Confirmation for TransID ${transactionId}:`, {
