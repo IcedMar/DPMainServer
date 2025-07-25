@@ -106,6 +106,10 @@ const reversalTimeoutsCollection = firestore.collection('reversal_timeouts'); //
 const bonusHistoryCollection = firestore.collection('bonus_history'); // NEW: Initialize this collection
 const stkTransactionsCollection = firestore.collection('stk_Transactions');
 const safaricomDealerConfigRef = firestore.collection('mpesa_settings').doc('main_config');
+const bulkAirtimeJobsCollection = firestore.collection('bulk_airtime_jobs');
+const bulkTransactionsCollection = firestore.collection('bulk_transactions');
+const bulkSalesCollection = firestore.collection('bulk_sales');
+const singleSalesCollection = firestore.collection('single_sales');
 
 // --- Africa's Talking Initialization ---
 const AfricasTalking = require('africastalking');
@@ -2441,9 +2445,47 @@ app.post('/api/bulk-airtime', async (req, res) => {
   if (Number(totalAmount) !== sumAmounts) {
     return res.status(400).json({ error: 'totalAmount does not match sum of request amounts.' });
   }
+
+  // Get user data to extract organization name
+  let organizationName = 'unknown';
   try {
-    const jobDoc = await firestore.collection('bulk_airtime_jobs').add({
+    const userDoc = await firestore.collection('users').doc(userId).get();
+    if (userDoc.exists) {
+      const userData = userDoc.data();
+      organizationName = userData.organizationName || userData.orgName || 'unknown';
+    }
+  } catch (err) {
+    console.error('Failed to get user data:', err);
+  }
+
+  // Deduct wallet balance before creating job
+  try {
+    const userRef = firestore.collection('users').doc(userId);
+    let userData;
+    await firestore.runTransaction(async (tx) => {
+      const userDoc = await tx.get(userRef);
+      if (!userDoc.exists) {
+        throw new Error('User not found.');
+      }
+      userData = userDoc.data();
+      const currentBalance = userData.walletBalance || 0;
+      if (currentBalance < totalAmount) {
+        throw new Error('Insufficient wallet balance.');
+      }
+      tx.update(userRef, {
+        walletBalance: FieldValue.increment(-totalAmount),
+        lastWalletUpdate: FieldValue.serverTimestamp()
+      });
+    });
+  } catch (err) {
+    console.error('Bulk airtime wallet deduction error:', err);
+    return res.status(400).json({ error: err.message || 'Failed to deduct wallet balance.' });
+  }
+
+  try {
+    const jobDoc = await bulkAirtimeJobsCollection.add({
       userId,
+      organizationName,
       requests,
       totalAmount,
       status: 'pending',
@@ -2452,7 +2494,23 @@ app.post('/api/bulk-airtime', async (req, res) => {
       results: [],
       currentIndex: 0
     });
-    res.json({ jobId: jobDoc.id });
+
+    // Create bulk transaction record
+    const bulkTransactionId = `BULK_${Date.now()}_${jobDoc.id}`;
+    await bulkTransactionsCollection.doc(bulkTransactionId).set({
+      transactionID: bulkTransactionId,
+      type: 'BULK_AIRTIME_PURCHASE',
+      userId,
+      organizationName,
+      totalAmount,
+      requestCount: requests.length,
+      status: 'PENDING_PROCESSING',
+      jobId: jobDoc.id,
+      createdAt: FieldValue.serverTimestamp(),
+      lastUpdated: FieldValue.serverTimestamp()
+    });
+
+    res.json({ jobId: jobDoc.id, bulkTransactionId });
   } catch (err) {
     console.error('Failed to create bulk airtime job:', err);
     res.status(500).json({ error: 'Failed to create job.' });
@@ -2463,7 +2521,7 @@ app.post('/api/bulk-airtime', async (req, res) => {
 app.get('/api/bulk-airtime-status/:jobId', async (req, res) => {
   const { jobId } = req.params;
   try {
-    const jobDoc = await firestore.collection('bulk_airtime_jobs').doc(jobId).get();
+    const jobDoc = await bulkAirtimeJobsCollection.doc(jobId).get();
     if (!jobDoc.exists) {
       return res.status(404).json({ error: 'Job not found.' });
     }
@@ -2481,7 +2539,7 @@ const BULK_AIRTIME_RECIPIENT_DELAY = 3000; // 3 seconds
 async function processBulkAirtimeJobs() {
   try {
     // Get jobs with status 'pending' or 'processing'
-    const jobsSnap = await firestore.collection('bulk_airtime_jobs')
+    const jobsSnap = await bulkAirtimeJobsCollection
       .where('status', 'in', ['pending', 'processing'])
       .orderBy('createdAt')
       .limit(2) // process up to 2 jobs at a time
@@ -2489,18 +2547,31 @@ async function processBulkAirtimeJobs() {
     for (const jobDoc of jobsSnap.docs) {
       const job = jobDoc.data();
       const jobId = jobDoc.id;
-      let { requests, results = [], currentIndex = 0, status } = job;
+      let { requests, results = [], currentIndex = 0, status, organizationName, userId, totalAmount } = job;
       if (!Array.isArray(requests) || currentIndex >= requests.length) {
         // Already done
-        await firestore.collection('bulk_airtime_jobs').doc(jobId).update({
+        await bulkAirtimeJobsCollection.doc(jobId).update({
           status: 'completed',
           updatedAt: FieldValue.serverTimestamp()
         });
+        
+        // Update bulk transaction status
+        const bulkTransactionQuery = await bulkTransactionsCollection
+          .where('jobId', '==', jobId)
+          .limit(1)
+          .get();
+        if (!bulkTransactionQuery.empty) {
+          const bulkTransactionDoc = bulkTransactionQuery.docs[0];
+          await bulkTransactionDoc.ref.update({
+            status: 'COMPLETED',
+            lastUpdated: FieldValue.serverTimestamp()
+          });
+        }
         continue;
       }
       // Mark as processing
       if (status !== 'processing') {
-        await firestore.collection('bulk_airtime_jobs').doc(jobId).update({
+        await bulkAirtimeJobsCollection.doc(jobId).update({
           status: 'processing',
           updatedAt: FieldValue.serverTimestamp()
         });
@@ -2543,8 +2614,30 @@ async function processBulkAirtimeJobs() {
           message = err.message || 'Exception during airtime dispatch';
         }
         results[currentIndex] = { phoneNumber, amount, telco, name, status: recipientStatus, message };
+        
+        // Create bulk sale record for successful airtime sends
+        if (recipientStatus === 'SUCCESS') {
+          const saleId = `BULK_SALE_${Date.now()}_${currentIndex}`;
+          await bulkSalesCollection.doc(organizationName).collection('sales').doc(saleId).set({
+            saleId,
+            type: 'BULK_AIRTIME_SALE',
+            userId,
+            organizationName,
+            jobId,
+            phoneNumber,
+            amount,
+            telco,
+            recipientName: name,
+            status: 'SUCCESS',
+            message,
+            dispatchResult,
+            createdAt: FieldValue.serverTimestamp(),
+            lastUpdated: FieldValue.serverTimestamp()
+          });
+        }
+        
         // Update job after each recipient
-        await firestore.collection('bulk_airtime_jobs').doc(jobId).update({
+        await bulkAirtimeJobsCollection.doc(jobId).update({
           results,
           currentIndex: currentIndex + 1,
           updatedAt: FieldValue.serverTimestamp()
@@ -2558,7 +2651,7 @@ async function processBulkAirtimeJobs() {
       }
       // If all done, mark as completed
       if (currentIndex >= requests.length) {
-        await firestore.collection('bulk_airtime_jobs').doc(jobId).update({
+        await bulkAirtimeJobsCollection.doc(jobId).update({
           status: 'completed',
           updatedAt: FieldValue.serverTimestamp()
         });
@@ -2620,4 +2713,121 @@ app.post('/api/mpesa/stkpush', async (req, res) => {
     console.error('STK Push error:', err.response?.data || err.message);
     res.status(500).json({ error: 'Failed to initiate STK Push.' });
   }
+});
+
+// --- SINGLE AIRTIME ENDPOINT ---
+app.post('/api/single-airtime', async (req, res) => {
+  const { requests, totalAmount, userId } = req.body;
+  
+  if (!Array.isArray(requests) || requests.length !== 1 || !totalAmount || !userId) {
+    return res.status(400).json({ error: 'Invalid request format. Expected single airtime request.' });
+  }
+
+  const { phoneNumber, amount, telco, name } = requests[0];
+  
+  if (!phoneNumber || !amount || !telco) {
+    return res.status(400).json({ error: 'Missing required fields: phoneNumber, amount, telco.' });
+  }
+
+  // Get user data to extract organization name
+  let organizationName = 'unknown';
+  try {
+    const userDoc = await firestore.collection('users').doc(userId).get();
+    if (userDoc.exists) {
+      const userData = userDoc.data();
+      organizationName = userData.organizationName || userData.orgName || 'unknown';
+    }
+  } catch (err) {
+    console.error('Failed to get user data:', err);
+  }
+
+  // Deduct wallet balance before sending airtime
+  try {
+    const userRef = firestore.collection('users').doc(userId);
+    let userData;
+    await firestore.runTransaction(async (tx) => {
+      const userDoc = await tx.get(userRef);
+      if (!userDoc.exists) {
+        throw new Error('User not found.');
+      }
+      userData = userDoc.data();
+      const currentBalance = userData.walletBalance || 0;
+      if (currentBalance < totalAmount) {
+        throw new Error('Insufficient wallet balance.');
+      }
+      tx.update(userRef, {
+        walletBalance: FieldValue.increment(-totalAmount),
+        lastWalletUpdate: FieldValue.serverTimestamp()
+      });
+    });
+  } catch (err) {
+    console.error('Single airtime wallet deduction error:', err);
+    return res.status(400).json({ error: err.message || 'Failed to deduct wallet balance.' });
+  }
+
+  // Send airtime
+  let status = 'FAILED';
+  let message = '';
+  let dispatchResult = null;
+  
+  try {
+    let result;
+    if (telco && telco.toLowerCase() === 'safaricom') {
+      result = await sendSafaricomAirtime(phoneNumber, amount);
+      if (result && result.status === 'SUCCESS') {
+        status = 'SUCCESS';
+        message = 'Airtime sent via Safaricom';
+      } else {
+        // Fallback to Africa's Talking
+        result = await sendAfricasTalkingAirtime(phoneNumber, amount, telco);
+        if (result && result.status === 'SUCCESS') {
+          status = 'SUCCESS';
+          message = 'Airtime sent via Africa\'s Talking fallback';
+        } else {
+          message = result && result.message ? result.message : 'Both Safaricom and fallback failed';
+        }
+      }
+    } else {
+      // Non-Safaricom: use Africa's Talking
+      result = await sendAfricasTalkingAirtime(phoneNumber, amount, telco);
+      if (result && result.status === 'SUCCESS') {
+        status = 'SUCCESS';
+        message = 'Airtime sent via Africa\'s Talking';
+      } else {
+        message = result && result.message ? result.message : 'Africa\'s Talking failed';
+      }
+    }
+    dispatchResult = result;
+  } catch (err) {
+    message = err.message || 'Exception during airtime dispatch';
+  }
+
+  // Create single sale record for successful airtime sends
+  if (status === 'SUCCESS') {
+    const saleId = `SINGLE_SALE_${Date.now()}`;
+    await singleSalesCollection.doc(organizationName).collection('sales').doc(saleId).set({
+      saleId,
+      type: 'SINGLE_AIRTIME_SALE',
+      userId,
+      organizationName,
+      phoneNumber,
+      amount,
+      telco,
+      recipientName: name || '',
+      status: 'SUCCESS',
+      message,
+      dispatchResult,
+      createdAt: FieldValue.serverTimestamp(),
+      lastUpdated: FieldValue.serverTimestamp()
+    });
+  }
+
+  res.json({ 
+    success: status === 'SUCCESS',
+    status,
+    message,
+    phoneNumber,
+    amount,
+    telco
+  });
 });
