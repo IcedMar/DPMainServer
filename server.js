@@ -256,7 +256,7 @@ const getFloatCollectionId = (telco) => {
 
 const getIndividualFloatBalance = async (floatType) => {
   try {
-    const doc = await db.collection(floatType).doc('current').get();
+    const doc = await firestore.collection(floatType).doc('current').get();
     return doc.exists ? doc.data().balance || 0 : 0;
   } catch (err) {
     console.error(`Error fetching ${floatType} float:`, err);
