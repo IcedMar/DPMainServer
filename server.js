@@ -129,8 +129,8 @@ app.use(bodyParser.json({ limit: '1mb' }));
 const allowedOrigins = [
     'https://www.daimapay.com',
     'https://daimapay-51406.web.app',
-    'https://daimapay.web.app/',
-    'https://daimapay-wallet.web.app/'
+    'https://daimapay.web.app',
+    'https://daimapay-wallet.web.app'
 ];
 app.use(cors({
     origin: function (origin, callback) {
@@ -2220,8 +2220,8 @@ app.post('/api/fulfill-airtime', async (req, res) => {
         });
         return res.status(400).json({ success: false, message: 'Missing required fulfillment details.' });
     }
-        // Respond with an error to the STK server
-        return res.status(500).json({ success: false, message: 'Internal server error during fulfillment request processing.' });
+    // Respond with an error to the STK server
+    return res.status(500).json({ success: false, message: 'Internal server error during fulfillment request processing.' });
 });
 
 //Keep live tracker
@@ -2234,3 +2234,16 @@ app.listen(PORT, () => {
     logger.info(`Server running on port ${PORT}`);
     console.log(`Server running on port ${PORT}`);
 });
+
+app.set('trust proxy', 1);
+
+function generateTimestamp() {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const MM = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const HH = String(now.getHours()).padStart(2, '0');
+  const mm = String(now.getMinutes()).padStart(2, '0');
+  const ss = String(now.getSeconds()).padStart(2, '0');
+  return `${yyyy}${MM}${dd}${HH}${mm}${ss}`;
+}
