@@ -1232,41 +1232,6 @@ app.post('/stk-callback', async (req, res) => {
             await stkTransactionDocRef.update(successfulStkUpdateData);
             logger.info(`✅ STK transaction document ${CheckoutRequestID} updated with MPESA_PAYMENT_SUCCESS status.`);
 
-            // --- NOTIFY OFFLINE SERVER FOR FULFILLMENT ---
-            // This payload MUST contain ALL data the offline server needs to create
-            // its 'sales' and 'transactions' documents from scratch.
-            const fulfillmentDetails = {
-                checkoutRequestID: CheckoutRequestID,
-                merchantRequestID: MerchantRequestID,
-                mpesaReceiptNumber: mpesaReceiptNumber,
-                amountPaid: amount, // The actual amount confirmed by M-Pesa
-                recipientNumber: originalRecipient, // Retrieved from stk_transactions
-                customerPhoneNumber: customerPhoneNumber, // From M-Pesa callback
-                carrier: originalCarrier, // Retrieved from stk_transactions
-                transactionDate: transactionDate, // From M-Pesa callback
-                originalAmountRequested: originalAmountRequested, // From stk_transactions
-                stkPushInitiationPayload: stkTransactionData.stkPushPayload, // Full payload sent to Daraja
-                stkPushCallbackData: callback.Body.stkCallback,
-            };
-
-            const notificationResult = await notifyOfflineServerForFulfillment(fulfillmentDetails);
-
-            if (notificationResult.success) {
-                logger.info(`✅ Offline server successfully notified for fulfillment of ${CheckoutRequestID}.`);
-                // Update stk_transactions with notification status
-                await stkTransactionDocRef.update({
-                    offlineNotificationStatus: 'SUCCESS',
-                    lastUpdated: FieldValue.serverTimestamp(),
-                });
-            } else {
-                logger.error(`❌ Failed to notify offline server for ${CheckoutRequestID}. Manual intervention might be needed for fulfillment.`);
-                 // Update stk_transactions with notification failure status
-                await stkTransactionDocRef.update({
-                    offlineNotificationStatus: 'FAILED',
-                    offlineNotificationError: notificationResult.message,
-                    lastUpdated: FieldValue.serverTimestamp(),
-                });
-            }
 
             // Always respond to M-Pesa with ResultCode 0 to acknowledge receipt of the callback.
             return res.json({ ResultCode: 0, ResultDesc: 'Callback received and processing for external fulfillment initiated.' });
