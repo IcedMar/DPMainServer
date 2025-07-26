@@ -2831,3 +2831,447 @@ app.post('/api/single-airtime', async (req, res) => {
     telco
   });
 });
+
+// --- ADMIN BULK OPERATIONS ENDPOINTS ---
+
+// Get all bulk transactions for admin
+app.get('/api/admin/bulk-transactions', async (req, res) => {
+  try {
+    const { page = 1, limit = 20, status, organizationName, startDate, endDate } = req.query;
+    const pageNumber = parseInt(page);
+    const pageSize = parseInt(limit);
+    const offset = (pageNumber - 1) * pageSize;
+
+    let query = bulkTransactionsCollection.orderBy('createdAt', 'desc');
+
+    // Apply filters
+    if (status) {
+      query = query.where('status', '==', status);
+    }
+    if (organizationName) {
+      query = query.where('organizationName', '==', organizationName);
+    }
+    if (startDate && endDate) {
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      query = query.where('createdAt', '>=', start).where('createdAt', '<=', end);
+    }
+
+    // Get total count for pagination
+    const countSnapshot = await query.get();
+    const totalCount = countSnapshot.size;
+
+    // Get paginated results
+    const snapshot = await query.limit(pageSize).offset(offset).get();
+    const transactions = [];
+
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      transactions.push({
+        id: doc.id,
+        ...data,
+        createdAt: data.createdAt?.toDate?.() || data.createdAt,
+        lastUpdated: data.lastUpdated?.toDate?.() || data.lastUpdated
+      });
+    }
+
+    res.json({
+      transactions,
+      pagination: {
+        currentPage: pageNumber,
+        pageSize,
+        totalCount,
+        totalPages: Math.ceil(totalCount / pageSize)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching bulk transactions:', error);
+    res.status(500).json({ error: 'Failed to fetch bulk transactions' });
+  }
+});
+
+// Get all bulk sales for admin
+app.get('/api/admin/bulk-sales', async (req, res) => {
+  try {
+    const { page = 1, limit = 20, organizationName, status, startDate, endDate } = req.query;
+    const pageNumber = parseInt(page);
+    const pageSize = parseInt(limit);
+    const offset = (pageNumber - 1) * pageSize;
+
+    let allSales = [];
+    let totalCount = 0;
+
+    if (organizationName) {
+      // Get sales for specific organization
+      const salesSnapshot = await bulkSalesCollection.doc(organizationName).collection('sales')
+        .orderBy('createdAt', 'desc')
+        .get();
+      
+      allSales = salesSnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        createdAt: doc.data().createdAt?.toDate?.() || doc.data().createdAt,
+        lastUpdated: doc.data().lastUpdated?.toDate?.() || doc.data().lastUpdated
+      }));
+    } else {
+      // Get all sales from all organizations
+      const orgsSnapshot = await bulkSalesCollection.get();
+      for (const orgDoc of orgsSnapshot.docs) {
+        const salesSnapshot = await orgDoc.ref.collection('sales')
+          .orderBy('createdAt', 'desc')
+          .get();
+        
+        const orgSales = salesSnapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data(),
+          createdAt: doc.data().createdAt?.toDate?.() || doc.data().createdAt,
+          lastUpdated: doc.data().lastUpdated?.toDate?.() || doc.data().lastUpdated
+        }));
+        allSales.push(...orgSales);
+      }
+    }
+
+    // Apply filters
+    if (status) {
+      allSales = allSales.filter(sale => sale.status === status);
+    }
+    if (startDate && endDate) {
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      allSales = allSales.filter(sale => {
+        const saleDate = sale.createdAt instanceof Date ? sale.createdAt : new Date(sale.createdAt);
+        return saleDate >= start && saleDate <= end;
+      });
+    }
+
+    totalCount = allSales.length;
+
+    // Apply pagination
+    const paginatedSales = allSales.slice(offset, offset + pageSize);
+
+    res.json({
+      sales: paginatedSales,
+      pagination: {
+        currentPage: pageNumber,
+        pageSize,
+        totalCount,
+        totalPages: Math.ceil(totalCount / pageSize)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching bulk sales:', error);
+    res.status(500).json({ error: 'Failed to fetch bulk sales' });
+  }
+});
+
+// Get bulk transaction details with associated sales
+app.get('/api/admin/bulk-transactions/:transactionId', async (req, res) => {
+  try {
+    const { transactionId } = req.params;
+    
+    // Get transaction details
+    const transactionDoc = await bulkTransactionsCollection.doc(transactionId).get();
+    if (!transactionDoc.exists) {
+      return res.status(404).json({ error: 'Bulk transaction not found' });
+    }
+
+    const transactionData = transactionDoc.data();
+    
+    // Get associated sales
+    const salesSnapshot = await bulkSalesCollection.doc(transactionData.organizationName)
+      .collection('sales')
+      .where('jobId', '==', transactionData.jobId)
+      .get();
+
+    const sales = salesSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+      createdAt: doc.data().createdAt?.toDate?.() || doc.data().createdAt,
+      lastUpdated: doc.data().lastUpdated?.toDate?.() || doc.data().lastUpdated
+    }));
+
+    res.json({
+      transaction: {
+        id: transactionDoc.id,
+        ...transactionData,
+        createdAt: transactionData.createdAt?.toDate?.() || transactionData.createdAt,
+        lastUpdated: transactionData.lastUpdated?.toDate?.() || transactionData.lastUpdated
+      },
+      sales
+    });
+  } catch (error) {
+    console.error('Error fetching bulk transaction details:', error);
+    res.status(500).json({ error: 'Failed to fetch bulk transaction details' });
+  }
+});
+
+// Get bulk transaction statistics for admin dashboard
+app.get('/api/admin/bulk-statistics', async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const start = startDate ? new Date(startDate) : new Date(new Date().setDate(new Date().getDate() - 30));
+    const end = endDate ? new Date(endDate) : new Date();
+
+    // Get transactions in date range
+    const transactionsSnapshot = await bulkTransactionsCollection
+      .where('createdAt', '>=', start)
+      .where('createdAt', '<=', end)
+      .get();
+
+    const transactions = transactionsSnapshot.docs.map(doc => doc.data());
+    
+    // Calculate statistics
+    const totalTransactions = transactions.length;
+    const totalAmount = transactions.reduce((sum, tx) => sum + (tx.totalAmount || 0), 0);
+    const completedTransactions = transactions.filter(tx => tx.status === 'COMPLETED').length;
+    const pendingTransactions = transactions.filter(tx => tx.status === 'PENDING_PROCESSING').length;
+    
+    // Get organization breakdown
+    const orgBreakdown = {};
+    transactions.forEach(tx => {
+      const org = tx.organizationName || 'unknown';
+      if (!orgBreakdown[org]) {
+        orgBreakdown[org] = { count: 0, amount: 0 };
+      }
+      orgBreakdown[org].count++;
+      orgBreakdown[org].amount += tx.totalAmount || 0;
+    });
+
+    res.json({
+      period: { start, end },
+      summary: {
+        totalTransactions,
+        totalAmount,
+        completedTransactions,
+        pendingTransactions,
+        successRate: totalTransactions > 0 ? (completedTransactions / totalTransactions * 100).toFixed(2) : 0
+      },
+      organizationBreakdown: orgBreakdown
+    });
+  } catch (error) {
+    console.error('Error fetching bulk statistics:', error);
+    res.status(500).json({ error: 'Failed to fetch bulk statistics' });
+  }
+});
+
+// --- USER BULK HISTORY ENDPOINTS ---
+
+// Get user's bulk airtime history
+app.get('/api/user/bulk-history/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { page = 1, limit = 20, status, startDate, endDate } = req.query;
+    const pageNumber = parseInt(page);
+    const pageSize = parseInt(limit);
+    const offset = (pageNumber - 1) * pageSize;
+
+    // Get user's bulk transactions
+    let transactionsQuery = bulkTransactionsCollection
+      .where('userId', '==', userId)
+      .orderBy('createdAt', 'desc');
+
+    // Apply filters
+    if (status) {
+      transactionsQuery = transactionsQuery.where('status', '==', status);
+    }
+    if (startDate && endDate) {
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      transactionsQuery = transactionsQuery.where('createdAt', '>=', start).where('createdAt', '<=', end);
+    }
+
+    const transactionsSnapshot = await transactionsQuery.get();
+    const transactions = [];
+
+    for (const doc of transactionsSnapshot.docs) {
+      const data = doc.data();
+      transactions.push({
+        id: doc.id,
+        ...data,
+        createdAt: data.createdAt?.toDate?.() || data.createdAt,
+        lastUpdated: data.lastUpdated?.toDate?.() || data.lastUpdated
+      });
+    }
+
+    // Get user's bulk sales
+    const userSales = [];
+    const orgsSnapshot = await bulkSalesCollection.get();
+    for (const orgDoc of orgsSnapshot.docs) {
+      const salesSnapshot = await orgDoc.ref.collection('sales')
+        .where('userId', '==', userId)
+        .orderBy('createdAt', 'desc')
+        .get();
+      
+      const orgSales = salesSnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        createdAt: doc.data().createdAt?.toDate?.() || doc.data().createdAt,
+        lastUpdated: doc.data().lastUpdated?.toDate?.() || doc.data().lastUpdated
+      }));
+      userSales.push(...orgSales);
+    }
+
+    // Get user's bulk airtime logs
+    const logsSnapshot = await firestore.collection('bulk_airtime_logs')
+      .where('userId', '==', userId)
+      .orderBy('requestedAt', 'desc')
+      .get();
+
+    const logs = logsSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+      requestedAt: doc.data().requestedAt?.toDate?.() || doc.data().requestedAt
+    }));
+
+    // Apply pagination to combined results
+    const allHistory = [
+      ...transactions.map(tx => ({ ...tx, type: 'transaction' })),
+      ...userSales.map(sale => ({ ...sale, type: 'sale' })),
+      ...logs.map(log => ({ ...log, type: 'log' }))
+    ].sort((a, b) => {
+      const dateA = a.createdAt || a.requestedAt;
+      const dateB = b.createdAt || b.requestedAt;
+      return new Date(dateB) - new Date(dateA);
+    });
+
+    const totalCount = allHistory.length;
+    const paginatedHistory = allHistory.slice(offset, offset + pageSize);
+
+    res.json({
+      history: paginatedHistory,
+      pagination: {
+        currentPage: pageNumber,
+        pageSize,
+        totalCount,
+        totalPages: Math.ceil(totalCount / pageSize)
+      },
+      summary: {
+        totalTransactions: transactions.length,
+        totalSales: userSales.length,
+        totalLogs: logs.length,
+        successfulTransactions: transactions.filter(tx => tx.status === 'COMPLETED').length,
+        successfulSales: userSales.filter(sale => sale.status === 'SUCCESS').length
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching user bulk history:', error);
+    res.status(500).json({ error: 'Failed to fetch user bulk history' });
+  }
+});
+
+// Get user's bulk transaction details
+app.get('/api/user/bulk-transactions/:transactionId', async (req, res) => {
+  try {
+    const { transactionId } = req.params;
+    const { userId } = req.query; // For security, verify user owns this transaction
+
+    const transactionDoc = await bulkTransactionsCollection.doc(transactionId).get();
+    if (!transactionDoc.exists) {
+      return res.status(404).json({ error: 'Bulk transaction not found' });
+    }
+
+    const transactionData = transactionDoc.data();
+    
+    // Security check - ensure user owns this transaction
+    if (transactionData.userId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Get associated sales
+    const salesSnapshot = await bulkSalesCollection.doc(transactionData.organizationName)
+      .collection('sales')
+      .where('jobId', '==', transactionData.jobId)
+      .where('userId', '==', userId)
+      .get();
+
+    const sales = salesSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+      createdAt: doc.data().createdAt?.toDate?.() || doc.data().createdAt,
+      lastUpdated: doc.data().lastUpdated?.toDate?.() || doc.data().lastUpdated
+    }));
+
+    // Get associated logs
+    const logsSnapshot = await firestore.collection('bulk_airtime_logs')
+      .where('userId', '==', userId)
+      .where('jobId', '==', transactionData.jobId)
+      .orderBy('requestIndex')
+      .get();
+
+    const logs = logsSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+      requestedAt: doc.data().requestedAt?.toDate?.() || doc.data().requestedAt
+    }));
+
+    res.json({
+      transaction: {
+        id: transactionDoc.id,
+        ...transactionData,
+        createdAt: transactionData.createdAt?.toDate?.() || transactionData.createdAt,
+        lastUpdated: transactionData.lastUpdated?.toDate?.() || transactionData.lastUpdated
+      },
+      sales,
+      logs
+    });
+  } catch (error) {
+    console.error('Error fetching user bulk transaction details:', error);
+    res.status(500).json({ error: 'Failed to fetch bulk transaction details' });
+  }
+});
+
+// Get user's bulk statistics
+app.get('/api/user/bulk-statistics/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { startDate, endDate } = req.query;
+    const start = startDate ? new Date(startDate) : new Date(new Date().setDate(new Date().getDate() - 30));
+    const end = endDate ? new Date(endDate) : new Date();
+
+    // Get user's transactions in date range
+    const transactionsSnapshot = await bulkTransactionsCollection
+      .where('userId', '==', userId)
+      .where('createdAt', '>=', start)
+      .where('createdAt', '<=', end)
+      .get();
+
+    const transactions = transactionsSnapshot.docs.map(doc => doc.data());
+
+    // Get user's sales in date range
+    const userSales = [];
+    const orgsSnapshot = await bulkSalesCollection.get();
+    for (const orgDoc of orgsSnapshot.docs) {
+      const salesSnapshot = await orgDoc.ref.collection('sales')
+        .where('userId', '==', userId)
+        .where('createdAt', '>=', start)
+        .where('createdAt', '<=', end)
+        .get();
+      
+      const orgSales = salesSnapshot.docs.map(doc => doc.data());
+      userSales.push(...orgSales);
+    }
+
+    // Calculate statistics
+    const totalTransactions = transactions.length;
+    const totalAmount = transactions.reduce((sum, tx) => sum + (tx.totalAmount || 0), 0);
+    const completedTransactions = transactions.filter(tx => tx.status === 'COMPLETED').length;
+    const successfulSales = userSales.filter(sale => sale.status === 'SUCCESS').length;
+    const totalSales = userSales.length;
+
+    res.json({
+      period: { start, end },
+      summary: {
+        totalTransactions,
+        totalAmount,
+        completedTransactions,
+        totalSales,
+        successfulSales,
+        successRate: totalTransactions > 0 ? (completedTransactions / totalTransactions * 100).toFixed(2) : 0,
+        salesSuccessRate: totalSales > 0 ? (successfulSales / totalSales * 100).toFixed(2) : 0
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching user bulk statistics:', error);
+    res.status(500).json({ error: 'Failed to fetch user bulk statistics' });
+  }
+});
