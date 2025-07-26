@@ -2358,110 +2358,10 @@ function generateTimestamp() {
   return `${yyyy}${MM}${dd}${HH}${mm}${ss}`;
 }
 
-// --- BULK AIRTIME ENDPOINT ---
-app.post('/api/bulk-airtime', async (req, res) => {
-  const { requests, totalAmount, userId } = req.body;
-  if (!Array.isArray(requests) || requests.length === 0 || !totalAmount || !userId) {
-    return res.status(400).json({ error: 'Missing required fields.' });
-  }
-
-  // Validate totalAmount matches sum of all amounts
-  const sumAmounts = requests.reduce((sum, r) => sum + Number(r.amount || 0), 0);
-  if (Number(totalAmount) !== sumAmounts) {
-    return res.status(400).json({ error: 'totalAmount does not match sum of request amounts.' });
-  }
-
-  // Deduct wallet balance before sending airtime
-  try {
-    const userRef = firestore.collection('users').doc(userId);
-    let userData;
-    await firestore.runTransaction(async (tx) => {
-      const userDoc = await tx.get(userRef);
-      if (!userDoc.exists) {
-        throw new Error('User not found.');
-      }
-      userData = userDoc.data();
-      const currentBalance = userData.walletBalance || 0;
-      if (currentBalance < totalAmount) {
-        throw new Error('Insufficient wallet balance.');
-      }
-      tx.update(userRef, {
-        walletBalance: FieldValue.increment(-totalAmount),
-        lastWalletUpdate: FieldValue.serverTimestamp()
-      });
-    });
-    // If transaction succeeds, proceed to send airtime
-  } catch (err) {
-    console.error('Bulk airtime wallet deduction error:', err);
-    return res.status(400).json({ error: err.message || 'Failed to deduct wallet balance.' });
-  }
-
-  const results = [];
-  for (let i = 0; i < requests.length; i++) {
-    const { phoneNumber, amount, telco, name } = requests[i];
-    let status = 'FAILED';
-    let message = '';
-    let dispatchResult = null;
-    try {
-      // Use your existing logic for sending airtime (carrier detection, fallback, float management, etc.)
-      let result;
-      if (telco && telco.toLowerCase() === 'safaricom') {
-        result = await sendSafaricomAirtime(phoneNumber, amount);
-        if (result && result.status === 'SUCCESS') {
-          status = 'SUCCESS';
-          message = 'Airtime sent via Safaricom';
-        } else {
-          // Fallback to Africa's Talking
-          result = await sendAfricasTalkingAirtime(phoneNumber, amount, telco);
-          if (result && result.status === 'SUCCESS') {
-            status = 'SUCCESS';
-            message = 'Airtime sent via Africa\'s Talking fallback';
-          } else {
-            message = result && result.message ? result.message : 'Both Safaricom and fallback failed';
-          }
-        }
-      } else {
-        // Non-Safaricom: use Africa's Talking
-        result = await sendAfricasTalkingAirtime(phoneNumber, amount, telco);
-        if (result && result.status === 'SUCCESS') {
-          status = 'SUCCESS';
-          message = 'Airtime sent via Africa\'s Talking';
-        } else {
-          message = result && result.message ? result.message : 'Africa\'s Talking failed';
-        }
-      }
-      dispatchResult = result;
-    } catch (err) {
-      message = err.message || 'Exception during airtime dispatch';
-    }
-
-    // Log each attempt in Firestore
-    try {
-      await firestore.collection('bulk_airtime_logs').add({
-        userId,
-        phoneNumber,
-        amount,
-        telco,
-        name,
-        status,
-        message,
-        dispatchResult,
-        requestedAt: FieldValue.serverTimestamp(),
-        requestIndex: i,
-      });
-    } catch (logErr) {
-      console.error('Failed to log bulk airtime attempt:', logErr);
-    }
-
-    results.push({ phoneNumber, amount, telco, name, status, message });
-    // Wait 3 seconds before next
-    if (i < requests.length - 1) {
-      await new Promise(resolve => setTimeout(resolve, 3000));
-    }
-  }
-
-  res.json({ results });
-});
+// --- BULK AIRTIME ENDPOINT (REMOVED DUPLICATE) ---
+// This endpoint was removed because it was processing airtime synchronously
+// and only logging to bulk_airtime_logs without creating bulk_sales records.
+// The queue-based endpoint below handles bulk airtime properly.
 
 // --- BULK AIRTIME QUEUE ENDPOINTS ---
 // 1. Submit a bulk airtime job
@@ -2582,12 +2482,16 @@ const BULK_AIRTIME_RECIPIENT_DELAY = 3000; // 3 seconds
 
 async function processBulkAirtimeJobs() {
   try {
+    logger.info('🔄 Bulk airtime worker starting...');
+    
     // Get jobs with status 'pending' or 'processing'
     const jobsSnap = await bulkAirtimeJobsCollection
       .where('status', 'in', ['pending', 'processing'])
       .orderBy('createdAt')
       .limit(2) // process up to 2 jobs at a time
       .get();
+    
+    logger.info(`📊 Found ${jobsSnap.docs.length} bulk airtime jobs to process`);
     for (const jobDoc of jobsSnap.docs) {
       const job = jobDoc.data();
       const jobId = jobDoc.id;
@@ -2718,7 +2622,9 @@ async function processBulkAirtimeJobs() {
         });
       }
     }
+    logger.info('✅ Bulk airtime worker completed processing cycle');
   } catch (err) {
+    logger.error('❌ Bulk airtime worker error:', err);
     console.error('Bulk airtime worker error:', err);
   }
 }
