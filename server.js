@@ -2527,18 +2527,32 @@ app.post('/api/bulk-airtime', async (req, res) => {
 
     // Create bulk transaction record
     const bulkTransactionId = `BULK_${Date.now()}_${jobDoc.id}`;
-    await bulkTransactionsCollection.doc(bulkTransactionId).set({
-      transactionID: bulkTransactionId,
-      type: 'BULK_AIRTIME_PURCHASE',
-      userId,
-      organizationName,
-      totalAmount,
-      requestCount: requests.length,
-      status: 'PENDING_PROCESSING',
-      jobId: jobDoc.id,
-      createdAt: FieldValue.serverTimestamp(),
-      lastUpdated: FieldValue.serverTimestamp()
-    });
+    logger.info(`🔄 Creating bulk transaction - userId: ${userId}, organizationName: ${organizationName}, totalAmount: ${totalAmount}, requestCount: ${requests.length}`);
+    
+    try {
+      await bulkTransactionsCollection.doc(bulkTransactionId).set({
+        transactionID: bulkTransactionId,
+        type: 'BULK_AIRTIME_PURCHASE',
+        userId,
+        organizationName,
+        totalAmount,
+        requestCount: requests.length,
+        status: 'PENDING_PROCESSING',
+        jobId: jobDoc.id,
+        createdAt: FieldValue.serverTimestamp(),
+        lastUpdated: FieldValue.serverTimestamp()
+      });
+      logger.info(`✅ Successfully created bulk transaction: ${bulkTransactionId} for org: ${organizationName}`);
+    } catch (err) {
+      logger.error(`❌ Failed to create bulk transaction for userId: ${userId}, organizationName: ${organizationName}`, { 
+        error: err.message, 
+        stack: err.stack,
+        userId,
+        organizationName,
+        totalAmount,
+        requestCount: requests.length
+      });
+    }
 
     res.json({ jobId: jobDoc.id, bulkTransactionId });
   } catch (err) {
@@ -2648,22 +2662,39 @@ async function processBulkAirtimeJobs() {
         // Create bulk sale record for successful airtime sends
         if (recipientStatus === 'SUCCESS') {
           const saleId = `BULK_SALE_${Date.now()}_${currentIndex}`;
-          await bulkSalesCollection.doc(organizationName).collection('sales').doc(saleId).set({
-            saleId,
-            type: 'BULK_AIRTIME_SALE',
-            userId,
-            organizationName,
-            jobId,
-            phoneNumber,
-            amount,
-            telco,
-            recipientName: name,
-            status: 'SUCCESS',
-            message,
-            dispatchResult,
-            createdAt: FieldValue.serverTimestamp(),
-            lastUpdated: FieldValue.serverTimestamp()
-          });
+          logger.info(`🔄 Attempting to write bulk sale for org: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`);
+          
+          try {
+            await bulkSalesCollection.doc(organizationName).collection('sales').doc(saleId).set({
+              saleId,
+              type: 'BULK_AIRTIME_SALE',
+              userId,
+              organizationName,
+              jobId,
+              phoneNumber,
+              amount,
+              telco,
+              recipientName: name,
+              status: 'SUCCESS',
+              message,
+              dispatchResult,
+              createdAt: FieldValue.serverTimestamp(),
+              lastUpdated: FieldValue.serverTimestamp()
+            });
+            logger.info(`✅ Successfully wrote bulk sale for org: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`);
+          } catch (err) {
+            logger.error(`❌ Failed to write bulk sale for org: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`, { 
+              error: err.message, 
+              stack: err.stack,
+              organizationName,
+              saleId,
+              phoneNumber,
+              amount,
+              jobId
+            });
+          }
+        } else {
+          logger.warn(`⚠️ Skipping bulk sale write for failed airtime send - phoneNumber: ${phoneNumber}, status: ${recipientStatus}, message: ${message}`);
         }
         
         // Update job after each recipient
@@ -2835,21 +2866,38 @@ app.post('/api/single-airtime', async (req, res) => {
   // Create single sale record for successful airtime sends
   if (status === 'SUCCESS') {
     const saleId = `SINGLE_SALE_${Date.now()}`;
-    await singleSalesCollection.doc(organizationName).collection('sales').doc(saleId).set({
-      saleId,
-      type: 'SINGLE_AIRTIME_SALE',
-      userId,
-      organizationName,
-      phoneNumber,
-      amount,
-      telco,
-      recipientName: name || '',
-      status: 'SUCCESS',
-      message,
-      dispatchResult,
-      createdAt: FieldValue.serverTimestamp(),
-      lastUpdated: FieldValue.serverTimestamp()
-    });
+    logger.info(`🔄 Attempting to write single sale for org: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`);
+    
+    try {
+      await singleSalesCollection.doc(organizationName).collection('sales').doc(saleId).set({
+        saleId,
+        type: 'SINGLE_AIRTIME_SALE',
+        userId,
+        organizationName,
+        phoneNumber,
+        amount,
+        telco,
+        recipientName: name || '',
+        status: 'SUCCESS',
+        message,
+        dispatchResult,
+        createdAt: FieldValue.serverTimestamp(),
+        lastUpdated: FieldValue.serverTimestamp()
+      });
+      logger.info(`✅ Successfully wrote single sale for org: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`);
+    } catch (err) {
+      logger.error(`❌ Failed to write single sale for org: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`, { 
+        error: err.message, 
+        stack: err.stack,
+        organizationName,
+        saleId,
+        phoneNumber,
+        amount,
+        userId
+      });
+    }
+  } else {
+    logger.warn(`⚠️ Skipping single sale write for failed airtime send - phoneNumber: ${phoneNumber}, status: ${status}, message: ${message}`);
   }
 
   res.json({ 
