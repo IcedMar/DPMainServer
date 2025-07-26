@@ -754,15 +754,24 @@ async function sendAfricasTalkingAirtime(phoneNumber, amount, carrier) {
         normalizedPhone = '+254' + phoneNumber.slice(1);
     } else if (phoneNumber.startsWith('254') && !phoneNumber.startsWith('+')) {
         normalizedPhone = '+' + phoneNumber;
-    } else if (!phoneNumber.startsWith('+254')) {
-        logger.error('[sendAfricasTalkingAirtime] Invalid phone format:', { phoneNumber: phoneNumber });
-        return {
-            status: 'FAILED',
-            message: 'Invalid phone number format for Africa\'s Talking',
-            details: {
-                error: 'Phone must start with +254, 254, or 0'
-            }
-        };
+    } else if (phoneNumber.startsWith('+254')) {
+        // Already in correct format
+        normalizedPhone = phoneNumber;
+    } else {
+        // Handle numbers without prefix (like 788403012) - assume it's a Kenyan number and add 0
+        if (phoneNumber.length === 9 && phoneNumber.startsWith('7')) {
+            normalizedPhone = '+254' + phoneNumber;
+            logger.info(`📱 Auto-normalized phone number: ${phoneNumber} → ${normalizedPhone}`);
+        } else {
+            logger.error('[sendAfricasTalkingAirtime] Invalid phone format:', { phoneNumber: phoneNumber });
+            return {
+                status: 'FAILED',
+                message: 'Invalid phone number format for Africa\'s Talking',
+                details: {
+                    error: 'Phone must start with +254, 254, 0, or be a 9-digit number starting with 7'
+                }
+            };
+        }
     }
 
     if (!process.env.AT_API_KEY || !process.env.AT_USERNAME) {
@@ -1889,32 +1898,49 @@ app.post('/c2b-confirmation', async (req, res) => {
         let walletUpdateResult = null;
         let bonusApplied = 0;
         let bonusPercentage = 0;
+        
+        logger.info(`🔍 C2B Confirmation - BillRefNumber: ${BillRefNumber}, isPhone: ${isPhone}, amount: ${amount}`);
         if (!isPhone) {
             // It's an account number: update walletBalance in users collection
+            logger.info(`🔄 Processing wallet top-up for accountNumber: ${BillRefNumber}, amount: ${amount}`);
+            
             const userSnap = await firestore.collection('users')
                 .where('accountNumber', '==', BillRefNumber)
                 .limit(1)
                 .get();
+            
             if (!userSnap.empty) {
                 const userDoc = userSnap.docs[0];
                 const userRef = userDoc.ref;
                 const userData = userDoc.data();
                 
+                logger.info(`✅ Found user: ${userDoc.id}, current wallet balance: ${userData.walletBalance || 0}`);
+                
                 // Fetch bonus percentage (global or per-user)
                 const bonusDoc = await firestore.collection('wallet_bonuses').doc('current_settings').get();
                 if (bonusDoc.exists) {
                     bonusPercentage = bonusDoc.data().percentage || 0;
+                    logger.info(`📊 Global bonus percentage: ${bonusPercentage}%`);
+                } else {
+                    logger.warn(`⚠️ No wallet_bonuses/current_settings document found`);
                 }
+                
                 // Per-user override
                 if (userData.walletBonusPercentage !== undefined) {
                     bonusPercentage = userData.walletBonusPercentage;
+                    logger.info(`📊 Using per-user bonus percentage: ${bonusPercentage}%`);
                 }
+                
                 bonusApplied = amount * (bonusPercentage / 100);
                 const totalToAdd = amount + bonusApplied;
+                
+                logger.info(`💰 Bonus calculation: amount=${amount}, bonusPercentage=${bonusPercentage}%, bonusApplied=${bonusApplied}, totalToAdd=${totalToAdd}`);
+                
                 await userRef.update({
                     walletBalance: FieldValue.increment(totalToAdd),
                     lastWalletUpdate: now
                 });
+                
                 walletUpdateResult = {
                     userId: userDoc.id,
                     accountNumber: BillRefNumber,
@@ -2388,28 +2414,22 @@ app.post('/api/bulk-airtime', async (req, res) => {
     console.error('Failed to get user data:', err);
   }
 
-  // Deduct wallet balance before creating job
+  // Check wallet balance before creating job (but don't deduct yet)
   try {
     const userRef = firestore.collection('users').doc(userId);
-    let userData;
-    await firestore.runTransaction(async (tx) => {
-      const userDoc = await tx.get(userRef);
-      if (!userDoc.exists) {
-        throw new Error('User not found.');
-      }
-      userData = userDoc.data();
-      const currentBalance = userData.walletBalance || 0;
-      if (currentBalance < totalAmount) {
-        throw new Error('Insufficient wallet balance.');
-      }
-      tx.update(userRef, {
-        walletBalance: FieldValue.increment(-totalAmount),
-        lastWalletUpdate: FieldValue.serverTimestamp()
-      });
-    });
+    const userDoc = await userRef.get();
+    if (!userDoc.exists) {
+      return res.status(400).json({ error: 'User not found.' });
+    }
+    const userData = userDoc.data();
+    const currentBalance = userData.walletBalance || 0;
+    if (currentBalance < totalAmount) {
+      return res.status(400).json({ error: 'Insufficient wallet balance.' });
+    }
+    logger.info(`✅ Wallet balance check passed - userId: ${userId}, currentBalance: ${currentBalance}, requiredAmount: ${totalAmount}`);
   } catch (err) {
-    console.error('Bulk airtime wallet deduction error:', err);
-    return res.status(400).json({ error: err.message || 'Failed to deduct wallet balance.' });
+    console.error('Bulk airtime wallet balance check error:', err);
+    return res.status(400).json({ error: err.message || 'Failed to check wallet balance.' });
   }
 
   try {
@@ -2440,7 +2460,10 @@ app.post('/api/bulk-airtime', async (req, res) => {
         status: 'PENDING_PROCESSING',
         jobId: jobDoc.id,
         createdAt: FieldValue.serverTimestamp(),
-        lastUpdated: FieldValue.serverTimestamp()
+        lastUpdated: FieldValue.serverTimestamp(),
+        actualAmountCharged: 0, // Will be updated when job completes
+        successfulCount: 0, // Will be updated when job completes
+        failedCount: 0 // Will be updated when job completes
       });
       logger.info(`✅ Successfully created bulk transaction: ${bulkTransactionId} for org: ${organizationName}`);
     } catch (err) {
@@ -2512,8 +2535,12 @@ async function processBulkAirtimeJobs() {
           const bulkTransactionDoc = bulkTransactionQuery.docs[0];
           await bulkTransactionDoc.ref.update({
             status: 'COMPLETED',
-            lastUpdated: FieldValue.serverTimestamp()
+            lastUpdated: FieldValue.serverTimestamp(),
+            actualAmountCharged: totalSuccessfulAmount,
+            successfulCount: successfulResults.length,
+            failedCount: results.length - successfulResults.length
           });
+          logger.info(`✅ Updated bulk transaction with final amounts - actualCharged: ${totalSuccessfulAmount}, successful: ${successfulResults.length}, failed: ${results.length - successfulResults.length}`);
         }
         continue;
       }
@@ -2614,11 +2641,43 @@ async function processBulkAirtimeJobs() {
           await new Promise(resolve => setTimeout(resolve, BULK_AIRTIME_RECIPIENT_DELAY));
         }
       }
-      // If all done, mark as completed
+      // If all done, mark as completed and deduct wallet for successful sends
       if (currentIndex >= requests.length) {
+        // Calculate total amount for successful sends only
+        const successfulResults = results.filter(r => r.status === 'SUCCESS');
+        const totalSuccessfulAmount = successfulResults.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+        
+        logger.info(`💰 Deducting wallet for successful sends - jobId: ${jobId}, successfulCount: ${successfulResults.length}, totalAmount: ${totalSuccessfulAmount}`);
+        
+        try {
+          const userRef = firestore.collection('users').doc(userId);
+          await firestore.runTransaction(async (tx) => {
+            const userDoc = await tx.get(userRef);
+            if (!userDoc.exists) {
+              throw new Error('User not found during wallet deduction.');
+            }
+            const userData = userDoc.data();
+            const currentBalance = userData.walletBalance || 0;
+            
+            // Deduct only the amount for successful sends
+            tx.update(userRef, {
+              walletBalance: FieldValue.increment(-totalSuccessfulAmount),
+              lastWalletUpdate: FieldValue.serverTimestamp()
+            });
+            
+            logger.info(`✅ Wallet deduction completed - userId: ${userId}, deductedAmount: ${totalSuccessfulAmount}, newBalance: ${currentBalance - totalSuccessfulAmount}`);
+          });
+        } catch (err) {
+          logger.error(`❌ Failed to deduct wallet for job ${jobId}:`, err);
+          // Continue with job completion even if wallet deduction fails
+        }
+        
         await bulkAirtimeJobsCollection.doc(jobId).update({
           status: 'completed',
-          updatedAt: FieldValue.serverTimestamp()
+          updatedAt: FieldValue.serverTimestamp(),
+          totalSuccessfulAmount: totalSuccessfulAmount,
+          successfulCount: successfulResults.length,
+          failedCount: results.length - successfulResults.length
         });
       }
     }
