@@ -1898,15 +1898,16 @@ app.post('/c2b-confirmation', async (req, res) => {
             if (!userSnap.empty) {
                 const userDoc = userSnap.docs[0];
                 const userRef = userDoc.ref;
+                const userData = userDoc.data();
+                
                 // Fetch bonus percentage (global or per-user)
-                // Example: global bonus
                 const bonusDoc = await firestore.collection('wallet_bonuses').doc('current_settings').get();
                 if (bonusDoc.exists) {
                     bonusPercentage = bonusDoc.data().percentage || 0;
                 }
-                // Example: per-user override
-                if (userDoc.data().walletBonusPercentage !== undefined) {
-                    bonusPercentage = userDoc.data().walletBonusPercentage;
+                // Per-user override
+                if (userData.walletBonusPercentage !== undefined) {
+                    bonusPercentage = userData.walletBonusPercentage;
                 }
                 bonusApplied = amount * (bonusPercentage / 100);
                 const totalToAdd = amount + bonusApplied;
@@ -1919,7 +1920,8 @@ app.post('/c2b-confirmation', async (req, res) => {
                     accountNumber: BillRefNumber,
                     incrementedBy: totalToAdd,
                     bonusApplied,
-                    bonusPercentage
+                    bonusPercentage,
+                    organizationName: userData.organizationName || userData.orgName || 'unknown'
                 };
                 logger.info(`✅ Updated walletBalance for user ${userDoc.id} (accountNumber: ${BillRefNumber}) by Ksh ${totalToAdd} (bonus: ${bonusApplied})`);
             } else {
@@ -1930,24 +1932,52 @@ app.post('/c2b-confirmation', async (req, res) => {
             topupNumber = BillRefNumber.replace(/\D/g, '');
         }
 
-        await transactionsCollection.doc(transactionId).set({
-            transactionID: transactionId,
-            type: 'C2B_PAYMENT', // Explicitly mark type
-            transactionTime: TransTime,
-            amountReceived: amount, // Original amount paid by customer
-            payerMsisdn: mpesaNumber,
-            payerName: customerName,
-            billRefNumber: BillRefNumber,
-            mpesaRawCallback: callbackData,
-            status: 'RECEIVED_PENDING_FULFILLMENT', // Set status to pending fulfillment
-            fulfillmentStatus: 'PENDING', // Initial fulfillment status
-            createdAt: now,
-            lastUpdated: now,
-            walletUpdateResult: walletUpdateResult || null,
-            walletBonusApplied: bonusApplied,
-            walletBonusPercentage: bonusPercentage
-        });
-        logger.info(`✅ Recorded incoming transaction ${transactionId} in 'transactions' collection.`);
+        // Store in appropriate collection based on BillRefNumber type
+        if (!isPhone) {
+            // Account number (wallet top-up): store in bulk_transactions
+            const bulkTransactionId = `WALLET_TOPUP_${Date.now()}_${transactionId}`;
+            await bulkTransactionsCollection.doc(bulkTransactionId).set({
+                transactionID: bulkTransactionId,
+                type: 'WALLET_TOPUP',
+                userId: walletUpdateResult?.userId || 'unknown',
+                organizationName: walletUpdateResult?.organizationName || 'unknown',
+                totalAmount: amount,
+                requestCount: 1, // Single wallet top-up
+                status: 'COMPLETED', // Wallet top-up is immediately completed
+                jobId: null, // No job for wallet top-up
+                createdAt: now,
+                lastUpdated: now,
+                walletUpdateResult: walletUpdateResult || null,
+                walletBonusApplied: bonusApplied,
+                walletBonusPercentage: bonusPercentage,
+                payerMsisdn: mpesaNumber,
+                payerName: customerName,
+                billRefNumber: BillRefNumber,
+                mpesaRawCallback: callbackData,
+                originalTransactionId: transactionId // Keep reference to original M-Pesa transaction
+            });
+            logger.info(`✅ Recorded wallet top-up transaction ${transactionId} in 'bulk_transactions' collection as ${bulkTransactionId}.`);
+        } else {
+            // Phone number (airtime top-up): store in transactions collection
+            await transactionsCollection.doc(transactionId).set({
+                transactionID: transactionId,
+                type: 'C2B_PAYMENT', // Explicitly mark type
+                transactionTime: TransTime,
+                amountReceived: amount, // Original amount paid by customer
+                payerMsisdn: mpesaNumber,
+                payerName: customerName,
+                billRefNumber: BillRefNumber,
+                mpesaRawCallback: callbackData,
+                status: 'RECEIVED_PENDING_FULFILLMENT', // Set status to pending fulfillment
+                fulfillmentStatus: 'PENDING', // Initial fulfillment status
+                createdAt: now,
+                lastUpdated: now,
+                walletUpdateResult: walletUpdateResult || null,
+                walletBonusApplied: bonusApplied,
+                walletBonusPercentage: bonusPercentage
+            });
+            logger.info(`✅ Recorded airtime transaction ${transactionId} in 'transactions' collection.`);
+        }
 
         // --- 2. Trigger the unified airtime fulfillment process only if phone number ---
         if (isPhone) {
