@@ -1082,6 +1082,9 @@ app.post('/stk-push', stkPushLimiter, async (req, res) => {
     try {
         const accessToken = await getAccessToken();
 
+        // Truncate AccountReference to M-Pesa limits (max 20 characters)
+        const truncatedAccountRef = cleanedRecipient.length > 20 ? cleanedRecipient.substring(0, 20) : cleanedRecipient;
+        
         const stkPushPayload = {
             BusinessShortCode: SHORTCODE,
             Password: password,
@@ -1092,7 +1095,7 @@ app.post('/stk-push', stkPushLimiter, async (req, res) => {
             PartyB: SHORTCODE, // Your Paybill/Till number
             PhoneNumber: cleanedCustomerPhone, // Customer's phone number
             CallBackURL: STK_CALLBACK_URL,
-            AccountReference: cleanedRecipient, // Use recipient number as account reference
+            AccountReference: truncatedAccountRef, // Use truncated recipient number as account reference
             TransactionDesc: `Airtime for ${cleanedRecipient}`
         };
 
@@ -3548,19 +3551,22 @@ app.post('/api/mpesa/stkpush', async (req, res) => {
     // Use existing token function (getAccessToken or getDarajaAccessToken)
     const token = await getAccessToken();
 
-    const payload = {
-      BusinessShortCode: SHORTCODE,
-      Password: password,
-      Timestamp: timestamp,
-      TransactionType: 'CustomerPayBillOnline',
-      Amount: Number(amount),
-      PartyA: phoneNumber,
-      PartyB: SHORTCODE,
-      PhoneNumber: phoneNumber,
-      CallBackURL: STK_CALLBACK_URL,
-      AccountReference: accountNumber,
-      TransactionDesc: 'Wallet Top Up'
-    };
+            // Truncate AccountReference to M-Pesa limits (max 20 characters)
+        const truncatedAccountRef = accountNumber.length > 20 ? accountNumber.substring(0, 20) : accountNumber;
+        
+        const payload = {
+          BusinessShortCode: SHORTCODE,
+          Password: password,
+          Timestamp: timestamp,
+          TransactionType: 'CustomerPayBillOnline',
+          Amount: Number(amount),
+          PartyA: phoneNumber,
+          PartyB: SHORTCODE,
+          PhoneNumber: phoneNumber,
+          CallBackURL: STK_CALLBACK_URL,
+          AccountReference: truncatedAccountRef,
+          TransactionDesc: 'Wallet Top Up'
+        };
 
     const stkRes = await axios.post(
       'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
