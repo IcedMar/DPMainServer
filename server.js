@@ -1320,7 +1320,9 @@ async function processAirtimeFulfillment({
     topupNumber,
     sourceCallbackData,
     requestType,
-    relatedSaleId = null
+    relatedSaleId = null,
+    driverUsername = null,
+    driverId = null
 }) {
     const now = FieldValue.serverTimestamp(); // Use server timestamp for consistency
     logger.info(`Starting airtime fulfillment for ${requestType} transaction: ${transactionId}`);
@@ -1628,6 +1630,63 @@ async function processAirtimeFulfillment({
             await salesCollection.doc(finalSaleId).update(updateSaleFields);
             logger.info(`✅ Updated sale document ${finalSaleId} with dispatch result (COMPLETED).`);
 
+            // --- Award driver commission if driver username was used ---
+            if (driverUsername && driverId) {
+                try {
+                    logger.info(`💰 Processing driver commission for username: ${driverUsername}, driverId: ${driverId}, amount: ${originalAmountPaid}`);
+                    
+                    // Get commission percentage from wallet_bonuses/drivers_comm
+                    const commissionDoc = await firestore.collection('wallet_bonuses').doc('drivers_comm').get();
+                    const commissionPercentage = commissionDoc.exists ? commissionDoc.data().percentage || 0 : 0;
+                    const commissionAmount = originalAmountPaid * (commissionPercentage / 100);
+                    
+                    logger.info(`📊 Driver commission calculation - percentage: ${commissionPercentage}%, amount: ${originalAmountPaid}, commission: ${commissionAmount}`);
+                    
+                    if (commissionAmount > 0) {
+                        // Update driver's commission earned
+                        await firestore.collection('drivers').doc(driverId).update({
+                            commissionEarned: FieldValue.increment(commissionAmount),
+                            lastCommissionUpdate: now
+                        });
+                        
+                        logger.info(`✅ Awarded commission ${commissionAmount} to driver ${driverUsername} (${driverId})`);
+                        
+                        // Log commission award in bonus_history
+                        await bonusHistoryCollection.add({
+                            type: 'DRIVER_COMMISSION_AWARDED',
+                            driverId: driverId,
+                            driverUsername: driverUsername,
+                            transactionId: transactionId,
+                            saleId: finalSaleId,
+                            originalAmount: originalAmountPaid,
+                            commissionPercentage: commissionPercentage,
+                            commissionAmount: commissionAmount,
+                            createdAt: now
+                        });
+                    } else {
+                        logger.warn(`⚠️ No commission awarded - percentage is 0 or document not found for driver ${driverUsername}`);
+                    }
+                } catch (commissionError) {
+                    logger.error(`❌ Error awarding driver commission for ${driverUsername}:`, {
+                        error: commissionError.message,
+                        driverId: driverId,
+                        amount: originalAmountPaid
+                    });
+                    
+                    // Log commission error but don't fail the transaction
+                    await errorsCollection.add({
+                        type: 'DRIVER_COMMISSION_ERROR',
+                        error: commissionError.message,
+                        driverId: driverId,
+                        driverUsername: driverUsername,
+                        transactionId: transactionId,
+                        saleId: finalSaleId,
+                        amount: originalAmountPaid,
+                        createdAt: now
+                    });
+                }
+            }
+
             // Also update the main transaction status to fulfilled
             await transactionsCollection.doc(transactionId).update({
                 status: 'COMPLETED_AND_FULFILLED',
@@ -1635,6 +1694,9 @@ async function processAirtimeFulfillment({
                 fulfillmentDetails: airtimeDispatchResult,
                 lastUpdated: now,
                 airtimeProviderUsed: airtimeProviderUsed,
+                driverCommissionAwarded: driverUsername ? true : false,
+                driverUsername: driverUsername || null,
+                driverId: driverId || null
             });
             logger.info(`✅ Transaction ${transactionId} marked as COMPLETED_AND_FULFILLED.`);
             return { success: true, status: 'COMPLETED_AND_FULFILLED' };
@@ -1774,10 +1836,12 @@ app.post('/c2b-validation', async (req, res) => {
     const amount = parseFloat(TransAmount);
 
     try {
-        // ✅ Validate phone format or account number
+        // ✅ Validate phone format, account number, or driver username
         const phoneRegex = /^(\+254|254|0)(1\d|7\d)\d{7}$/;
         const isPhone = phoneRegex.test(BillRefNumber);
         let isAccountNumber = false;
+        let isDriverUsername = false;
+        
         if (!isPhone) {
             // Check if BillRefNumber matches a registered account number across all user collections
             const [retailersSnap, driversSnap, organisationsSnap] = await Promise.all([
@@ -1786,11 +1850,18 @@ app.post('/c2b-validation', async (req, res) => {
                 firestore.collection('organisations').where('accountNumber', '==', BillRefNumber).limit(1).get()
             ]);
             isAccountNumber = !retailersSnap.empty || !driversSnap.empty || !organisationsSnap.empty;
+            
+            // If not an account number, check if it's a driver username
+            if (!isAccountNumber) {
+                const driversUsernameSnap = await firestore.collection('drivers').where('username', '==', BillRefNumber).limit(1).get();
+                isDriverUsername = !driversUsernameSnap.empty;
+            }
         }
-        if (!isPhone && !isAccountNumber) {
+        
+        if (!isPhone && !isAccountNumber && !isDriverUsername) {
             throw {
                 code: 'C2B00012',
-                desc: `Invalid BillRefNumber format: ${BillRefNumber}`,
+                desc: `Invalid BillRefNumber format: ${BillRefNumber}. Must be a phone number, account number, or driver username.`,
                 subType: 'INVALID_BILL_REF'
             };
         }
@@ -1896,20 +1967,20 @@ app.post('/c2b-confirmation', async (req, res) => {
             return res.json({ "ResultCode": 0, "ResultDesc": "Duplicate C2B confirmation received and ignored." });
         }
 
-        // Check if BillRefNumber is a phone number or account number
+        // Check if BillRefNumber is a phone number, account number, or driver username
         const phoneRegex = /^(\+254|254|0)(1\d|7\d)\d{7}$/;
         const isPhone = phoneRegex.test(BillRefNumber);
         let topupNumber = BillRefNumber;
         let walletUpdateResult = null;
         let bonusApplied = 0;
         let bonusPercentage = 0;
+        let driverUsername = null;
+        let driverId = null;
         
         logger.info(`🔍 C2B Confirmation - BillRefNumber: ${BillRefNumber}, isPhone: ${isPhone}, amount: ${amount}`);
+        
         if (!isPhone) {
-            // It's an account number: update walletBalance across all user collections
-            logger.info(`🔄 Processing wallet top-up for accountNumber: ${BillRefNumber}, amount: ${amount}`);
-            
-            // Check across all user collections
+            // Check if it's an account number first
             const [retailersSnap, driversSnap, organisationsSnap] = await Promise.all([
                 firestore.collection('retailers').where('accountNumber', '==', BillRefNumber).limit(1).get(),
                 firestore.collection('drivers').where('accountNumber', '==', BillRefNumber).limit(1).get(),
@@ -1936,6 +2007,20 @@ app.post('/c2b-confirmation', async (req, res) => {
                 userRef = userDoc.ref;
                 userData = userDoc.data();
                 userCollection = 'organisations';
+            }
+            
+            // If not found as account number, check if it's a driver username
+            if (!userDoc) {
+                const driversUsernameSnap = await firestore.collection('drivers').where('username', '==', BillRefNumber).limit(1).get();
+                if (!driversUsernameSnap.empty) {
+                    userDoc = driversUsernameSnap.docs[0];
+                    userRef = userDoc.ref;
+                    userData = userDoc.data();
+                    userCollection = 'drivers';
+                    driverUsername = BillRefNumber;
+                    driverId = userDoc.id;
+                    logger.info(`✅ Found driver by username: ${driverUsername}, driverId: ${driverId}`);
+                }
             }
             
             if (userDoc) {
@@ -2049,6 +2134,8 @@ app.post('/c2b-confirmation', async (req, res) => {
                 sourceCallbackData: callbackData,
                 requestType: 'C2B',
                 // relatedSaleId is null here as C2B creates its own sale doc
+                driverUsername: driverUsername, // Pass driver username if present
+                driverId: driverId // Pass driver ID if present
             });
             logger.info(`C2B Confirmation for TransID ${transactionId} completed. Fulfillment Result:`, fulfillmentResult);
         }
@@ -3551,22 +3638,22 @@ app.post('/api/mpesa/stkpush', async (req, res) => {
     // Use existing token function (getAccessToken or getDarajaAccessToken)
     const token = await getAccessToken();
 
-            // Truncate AccountReference to M-Pesa limits (max 20 characters)
-        const truncatedAccountRef = accountNumber.length > 20 ? accountNumber.substring(0, 20) : accountNumber;
-        
-        const payload = {
-          BusinessShortCode: SHORTCODE,
-          Password: password,
-          Timestamp: timestamp,
-          TransactionType: 'CustomerPayBillOnline',
-          Amount: Number(amount),
-          PartyA: phoneNumber,
-          PartyB: SHORTCODE,
-          PhoneNumber: phoneNumber,
-          CallBackURL: STK_CALLBACK_URL,
-          AccountReference: truncatedAccountRef,
-          TransactionDesc: 'Wallet Top Up'
-        };
+    // Truncate AccountReference to M-Pesa limits (max 20 characters)
+    const truncatedAccountRef = accountNumber.length > 20 ? accountNumber.substring(0, 20) : accountNumber;
+    
+    const payload = {
+      BusinessShortCode: SHORTCODE,
+      Password: password,
+      Timestamp: timestamp,
+      TransactionType: 'CustomerPayBillOnline',
+      Amount: Number(amount),
+      PartyA: phoneNumber,
+      PartyB: SHORTCODE,
+      PhoneNumber: phoneNumber,
+      CallBackURL: STK_CALLBACK_URL,
+      AccountReference: truncatedAccountRef,
+      TransactionDesc: 'Wallet Top Up'
+    };
 
     const stkRes = await axios.post(
       'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
@@ -3588,6 +3675,70 @@ app.post('/api/mpesa/stkpush', async (req, res) => {
   } catch (err) {
     console.error('STK Push error:', err.response?.data || err.message);
     res.status(500).json({ error: 'Failed to initiate STK Push.' });
+  }
+});
+
+// --- DRIVER STK PUSH INITIATION ENDPOINT ---
+app.post('/api/driver/stkpush', async (req, res) => {
+  const { amount, customerPhone, driverUsername, recipientPhone, telco } = req.body;
+  
+  if (!amount || !customerPhone || !driverUsername || !recipientPhone || !telco) {
+    return res.status(400).json({ error: 'Missing required fields: amount, customerPhone, driverUsername, recipientPhone, telco.' });
+  }
+
+  try {
+    // Validate driver exists
+    const driverDoc = await firestore.collection('drivers').where('username', '==', driverUsername).limit(1).get();
+    if (driverDoc.empty) {
+      return res.status(400).json({ error: 'Driver not found with the provided username.' });
+    }
+
+    const timestamp = generateTimestamp();
+    const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
+    const token = await getAccessToken();
+
+    // Use driver username as AccountReference (truncated to 20 chars)
+    const truncatedDriverUsername = driverUsername.length > 20 ? driverUsername.substring(0, 20) : driverUsername;
+    
+    const payload = {
+      BusinessShortCode: SHORTCODE,
+      Password: password,
+      Timestamp: timestamp,
+      TransactionType: 'CustomerPayBillOnline',
+      Amount: Number(amount),
+      PartyA: customerPhone,
+      PartyB: SHORTCODE,
+      PhoneNumber: customerPhone,
+      CallBackURL: STK_CALLBACK_URL,
+      AccountReference: truncatedDriverUsername,
+      TransactionDesc: 'Driver Airtime Sale'
+    };
+
+    const stkRes = await axios.post(
+      'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    logger.info(`🚗 Driver STK Push initiated - driver: ${driverUsername}, customer: ${customerPhone}, recipient: ${recipientPhone}, amount: ${amount}`);
+    
+    res.json({
+      message: 'Driver STK Push initiated. Await callback for confirmation.',
+      merchantRequestID: stkRes.data.MerchantRequestID,
+      checkoutRequestID: stkRes.data.CheckoutRequestID,
+      responseDescription: stkRes.data.ResponseDescription,
+      driverUsername: driverUsername,
+      recipientPhone: recipientPhone,
+      telco: telco
+    });
+  } catch (err) {
+    logger.error('Driver STK Push error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to initiate Driver STK Push.' });
   }
 });
 
