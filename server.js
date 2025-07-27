@@ -1776,12 +1776,13 @@ app.post('/c2b-validation', async (req, res) => {
         const isPhone = phoneRegex.test(BillRefNumber);
         let isAccountNumber = false;
         if (!isPhone) {
-            // Check if BillRefNumber matches a registered user's account number
-            const userSnap = await firestore.collection('users')
-                .where('accountNumber', '==', BillRefNumber)
-                .limit(1)
-                .get();
-            isAccountNumber = !userSnap.empty;
+            // Check if BillRefNumber matches a registered account number across all user collections
+            const [retailersSnap, driversSnap, organisationsSnap] = await Promise.all([
+                firestore.collection('retailers').where('accountNumber', '==', BillRefNumber).limit(1).get(),
+                firestore.collection('drivers').where('accountNumber', '==', BillRefNumber).limit(1).get(),
+                firestore.collection('organisations').where('accountNumber', '==', BillRefNumber).limit(1).get()
+            ]);
+            isAccountNumber = !retailersSnap.empty || !driversSnap.empty || !organisationsSnap.empty;
         }
         if (!isPhone && !isAccountNumber) {
             throw {
@@ -1902,18 +1903,39 @@ app.post('/c2b-confirmation', async (req, res) => {
         
         logger.info(`🔍 C2B Confirmation - BillRefNumber: ${BillRefNumber}, isPhone: ${isPhone}, amount: ${amount}`);
         if (!isPhone) {
-            // It's an account number: update walletBalance in users collection
+            // It's an account number: update walletBalance across all user collections
             logger.info(`🔄 Processing wallet top-up for accountNumber: ${BillRefNumber}, amount: ${amount}`);
             
-            const userSnap = await firestore.collection('users')
-                .where('accountNumber', '==', BillRefNumber)
-                .limit(1)
-                .get();
+            // Check across all user collections
+            const [retailersSnap, driversSnap, organisationsSnap] = await Promise.all([
+                firestore.collection('retailers').where('accountNumber', '==', BillRefNumber).limit(1).get(),
+                firestore.collection('drivers').where('accountNumber', '==', BillRefNumber).limit(1).get(),
+                firestore.collection('organisations').where('accountNumber', '==', BillRefNumber).limit(1).get()
+            ]);
             
-            if (!userSnap.empty) {
-                const userDoc = userSnap.docs[0];
-                const userRef = userDoc.ref;
-                const userData = userDoc.data();
+            let userDoc = null;
+            let userRef = null;
+            let userData = null;
+            let userCollection = null;
+            
+            if (!retailersSnap.empty) {
+                userDoc = retailersSnap.docs[0];
+                userRef = userDoc.ref;
+                userData = userDoc.data();
+                userCollection = 'retailers';
+            } else if (!driversSnap.empty) {
+                userDoc = driversSnap.docs[0];
+                userRef = userDoc.ref;
+                userData = userDoc.data();
+                userCollection = 'drivers';
+            } else if (!organisationsSnap.empty) {
+                userDoc = organisationsSnap.docs[0];
+                userRef = userDoc.ref;
+                userData = userDoc.data();
+                userCollection = 'organisations';
+            }
+            
+            if (userDoc) {
                 
                 logger.info(`✅ Found user: ${userDoc.id}, current wallet balance: ${userData.walletBalance || 0}`);
                 
@@ -1940,17 +1962,24 @@ app.post('/c2b-confirmation', async (req, res) => {
                 await userRef.update({
                     walletBalance: FieldValue.increment(totalToAdd),
                     lastWalletUpdate: now
+
                 });
+                // --- Set hasMadeFirstTopUp to true if this is the first deposit ---
+                if (!userData.hasMadeFirstTopUp) {
+                    await userRef.update({ hasMadeFirstTopUp: true });
+                    logger.info(`🎉 Set hasMadeFirstTopUp to true for user ${userDoc.id} (${userCollection})`);
+                }
                 
                 walletUpdateResult = {
                     userId: userDoc.id,
+                    userCollection: userCollection,
                     accountNumber: BillRefNumber,
                     incrementedBy: totalToAdd,
                     bonusApplied,
                     bonusPercentage,
                     organizationName: userData.organizationName || userData.orgName || 'unknown'
                 };
-                logger.info(`✅ Updated walletBalance for user ${userDoc.id} (accountNumber: ${BillRefNumber}) by Ksh ${totalToAdd} (bonus: ${bonusApplied})`);
+                logger.info(`✅ Updated walletBalance for user ${userDoc.id} (${userCollection}, accountNumber: ${BillRefNumber}) by Ksh ${totalToAdd} (bonus: ${bonusApplied})`);
             } else {
                 logger.warn(`⚠️ No user found with accountNumber: ${BillRefNumber} for wallet update.`);
             }
@@ -2366,6 +2395,763 @@ app.get("/ping", (req, res) => {
   res.status(200).send("pong");
 });
 
+// --- DRIVER ENDPOINTS ---
+
+// 1. Register Driver
+app.post('/api/register-driver', async (req, res) => {
+  const { username, email, password, contactPerson, phoneNumber, idNumber } = req.body;
+  
+  if (!username || !email || !password || !contactPerson || !phoneNumber || !idNumber) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'All fields are required' 
+    });
+  }
+
+  try {
+    // Check if driver already exists
+    const existingDriver = await firestore.collection('drivers')
+      .where('email', '==', email)
+      .limit(1)
+      .get();
+
+    if (!existingDriver.empty) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Driver with this email already exists' 
+      });
+    }
+
+    // Generate account number
+    const accountNumber = `DaimaPay#${username.toLowerCase().replace(/\s+/g, '')}`;
+    
+    // Create driver document
+    const driverRef = await firestore.collection('drivers').add({
+      username,
+      email,
+      password: crypto.createHash('sha256').update(password).digest('hex'), // Hash password
+      contactPerson,
+      phoneNumber,
+      idNumber,
+      walletBalance: 0,
+      commissionEarned: 0,
+      accountNumber,
+      createdAt: FieldValue.serverTimestamp(),
+      userType: 'driver',
+      totalTransactions: 0,
+      hasMadeFirstTopUp: false,
+      isSuspended: false,
+      suspendedAt: null,
+      failedLoginAttempts: 0,
+      lastFailedAttempt: null
+    });
+
+    res.json({
+      success: true,
+      driverId: driverRef.id,
+      message: 'Driver registered successfully'
+    });
+  } catch (error) {
+    logger.error('Driver registration error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to register driver' 
+    });
+  }
+});
+
+// 2. Get Driver Wallet
+app.get('/api/driver-wallet/:driverId', async (req, res) => {
+  const { driverId } = req.params;
+
+  try {
+    const driverDoc = await firestore.collection('drivers').doc(driverId).get();
+    
+    if (!driverDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Driver not found' 
+      });
+    }
+
+    const driverData = driverDoc.data();
+    
+    res.json({
+      success: true,
+      walletBalance: driverData.walletBalance || 0,
+      commissionEarned: driverData.commissionEarned || 0,
+      hasMadeFirstTopUp: driverData.hasMadeFirstTopUp || false
+    });
+  } catch (error) {
+    logger.error('Get driver wallet error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to get driver wallet' 
+    });
+  }
+});
+
+// 3. Top Up Wallet (STK Push)
+app.post('/api/driver-wallet/topup', async (req, res) => {
+  const { driverId, amount, phoneNumber } = req.body;
+
+  if (!driverId || !amount || !phoneNumber) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Missing required fields' 
+    });
+  }
+
+  try {
+    // Verify driver exists
+    const driverDoc = await firestore.collection('drivers').doc(driverId).get();
+    if (!driverDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Driver not found' 
+      });
+    }
+
+    const driverData = driverDoc.data();
+    const accountNumber = driverData.accountNumber;
+
+    // Initiate STK Push using existing logic
+    const timestamp = generateTimestamp();
+    const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
+    const token = await getAccessToken();
+
+    const payload = {
+      BusinessShortCode: SHORTCODE,
+      Password: password,
+      Timestamp: timestamp,
+      TransactionType: 'CustomerPayBillOnline',
+      Amount: Number(amount),
+      PartyA: phoneNumber,
+      PartyB: SHORTCODE,
+      PhoneNumber: phoneNumber,
+      CallBackURL: STK_CALLBACK_URL,
+      AccountReference: accountNumber,
+      TransactionDesc: 'Driver Wallet Top Up'
+    };
+
+    const stkRes = await axios.post(
+      'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    res.json({
+      success: true,
+      message: 'STK Push initiated for wallet top-up',
+      merchantRequestID: stkRes.data.MerchantRequestID,
+      checkoutRequestID: stkRes.data.CheckoutRequestID,
+      walletBalance: driverData.walletBalance || 0
+    });
+  } catch (error) {
+    logger.error('Driver wallet top-up error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to initiate wallet top-up' 
+    });
+  }
+});
+
+// 4. Withdraw from Wallet (STK Push to driver)
+app.post('/api/driver-wallet/withdraw', async (req, res) => {
+  const { driverId, amount, phoneNumber } = req.body;
+
+  if (!driverId || !amount || !phoneNumber) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Missing required fields' 
+    });
+  }
+
+  try {
+    // Verify driver exists and has sufficient balance
+    const driverRef = firestore.collection('drivers').doc(driverId);
+    
+    await firestore.runTransaction(async (tx) => {
+      const driverDoc = await tx.get(driverRef);
+      if (!driverDoc.exists) {
+        throw new Error('Driver not found');
+      }
+
+      const driverData = driverDoc.data();
+      const currentBalance = driverData.walletBalance || 0;
+      
+      if (currentBalance < amount) {
+        throw new Error('Insufficient wallet balance');
+      }
+
+      // Deduct from wallet
+      tx.update(driverRef, {
+        walletBalance: FieldValue.increment(-amount),
+        lastWalletUpdate: FieldValue.serverTimestamp()
+      });
+
+      // Initiate STK Push to driver's phone number
+      const timestamp = generateTimestamp();
+      const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
+      const token = await getAccessToken();
+
+      const payload = {
+        BusinessShortCode: SHORTCODE,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: 'CustomerPayBillOnline',
+        Amount: Number(amount),
+        PartyA: phoneNumber,
+        PartyB: SHORTCODE,
+        PhoneNumber: phoneNumber,
+        CallBackURL: STK_CALLBACK_URL,
+        AccountReference: `WITHDRAW_${driverId}`,
+        TransactionDesc: 'Driver Wallet Withdrawal'
+      };
+
+      const stkRes = await axios.post(
+        'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+        payload,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      // Log transaction
+      await firestore.collection('transactions').add({
+        driverId,
+        type: 'WALLET_WITHDRAWAL',
+        amount: -amount,
+        phoneNumber,
+        status: 'PENDING',
+        merchantRequestID: stkRes.data.MerchantRequestID,
+        checkoutRequestID: stkRes.data.CheckoutRequestID,
+        createdAt: FieldValue.serverTimestamp()
+      });
+
+      return {
+        success: true,
+        message: 'Withdrawal initiated',
+        walletBalance: currentBalance - amount,
+        merchantRequestID: stkRes.data.MerchantRequestID,
+        checkoutRequestID: stkRes.data.CheckoutRequestID
+      };
+    });
+
+    res.json({
+      success: true,
+      message: 'Withdrawal initiated successfully',
+      walletBalance: (await driverRef.get()).data().walletBalance
+    });
+  } catch (error) {
+    logger.error('Driver wallet withdrawal error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || 'Failed to initiate withdrawal' 
+    });
+  }
+});
+
+// 5. Get Driver Commission
+app.get('/api/driver-commission/:driverId', async (req, res) => {
+  const { driverId } = req.params;
+
+  try {
+    const driverDoc = await firestore.collection('drivers').doc(driverId).get();
+    
+    if (!driverDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Driver not found' 
+      });
+    }
+
+    const driverData = driverDoc.data();
+    
+    res.json({
+      success: true,
+      commissionEarned: driverData.commissionEarned || 0
+    });
+  } catch (error) {
+    logger.error('Get driver commission error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to get driver commission' 
+    });
+  }
+});
+
+// 6. Withdraw Commission (STK Push to driver)
+app.post('/api/driver-commission/withdraw', async (req, res) => {
+  const { driverId, amount, phoneNumber } = req.body;
+
+  if (!driverId || !amount || !phoneNumber) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Missing required fields' 
+    });
+  }
+
+  try {
+    // Verify driver exists and has sufficient commission
+    const driverRef = firestore.collection('drivers').doc(driverId);
+    
+    await firestore.runTransaction(async (tx) => {
+      const driverDoc = await tx.get(driverRef);
+      if (!driverDoc.exists) {
+        throw new Error('Driver not found');
+      }
+
+      const driverData = driverDoc.data();
+      const currentCommission = driverData.commissionEarned || 0;
+      
+      if (currentCommission < amount) {
+        throw new Error('Insufficient commission balance');
+      }
+
+      // Deduct commission
+      tx.update(driverRef, {
+        commissionEarned: FieldValue.increment(-amount)
+      });
+
+      // Initiate STK Push to driver's phone number
+      const timestamp = generateTimestamp();
+      const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
+      const token = await getAccessToken();
+
+      const payload = {
+        BusinessShortCode: SHORTCODE,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: 'CustomerPayBillOnline',
+        Amount: Number(amount),
+        PartyA: phoneNumber,
+        PartyB: SHORTCODE,
+        PhoneNumber: phoneNumber,
+        CallBackURL: STK_CALLBACK_URL,
+        AccountReference: `COMMISSION_${driverId}`,
+        TransactionDesc: 'Driver Commission Withdrawal'
+      };
+
+      const stkRes = await axios.post(
+        'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+        payload,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      // Log transaction
+      await firestore.collection('transactions').add({
+        driverId,
+        type: 'COMMISSION_WITHDRAWAL',
+        amount: -amount,
+        phoneNumber,
+        status: 'PENDING',
+        merchantRequestID: stkRes.data.MerchantRequestID,
+        checkoutRequestID: stkRes.data.CheckoutRequestID,
+        createdAt: FieldValue.serverTimestamp()
+      });
+
+      return {
+        success: true,
+        message: 'Commission withdrawal initiated',
+        commissionEarned: currentCommission - amount,
+        merchantRequestID: stkRes.data.MerchantRequestID,
+        checkoutRequestID: stkRes.data.CheckoutRequestID
+      };
+    });
+
+    res.json({
+      success: true,
+      message: 'Commission withdrawal initiated successfully',
+      commissionEarned: (await driverRef.get()).data().commissionEarned
+    });
+  } catch (error) {
+    logger.error('Driver commission withdrawal error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || 'Failed to initiate commission withdrawal' 
+    });
+  }
+});
+
+// 7. Commission to Wallet
+app.post('/api/driver-commission/topup-wallet', async (req, res) => {
+  const { driverId, amount } = req.body;
+
+  if (!driverId || !amount) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Missing required fields' 
+    });
+  }
+
+  try {
+    // Transfer commission to wallet
+    const driverRef = firestore.collection('drivers').doc(driverId);
+    
+    await firestore.runTransaction(async (tx) => {
+      const driverDoc = await tx.get(driverRef);
+      if (!driverDoc.exists) {
+        throw new Error('Driver not found');
+      }
+
+      const driverData = driverDoc.data();
+      const currentCommission = driverData.commissionEarned || 0;
+      
+      if (currentCommission < amount) {
+        throw new Error('Insufficient commission balance');
+      }
+
+      // Transfer commission to wallet
+      tx.update(driverRef, {
+        commissionEarned: FieldValue.increment(-amount),
+        walletBalance: FieldValue.increment(amount),
+        lastWalletUpdate: FieldValue.serverTimestamp()
+      });
+
+      // Log transaction
+      await firestore.collection('transactions').add({
+        driverId,
+        type: 'COMMISSION_TO_WALLET',
+        amount: amount,
+        status: 'COMPLETED',
+        createdAt: FieldValue.serverTimestamp()
+      });
+    });
+
+    const updatedDriver = await driverRef.get();
+    const updatedData = updatedDriver.data();
+
+    res.json({
+      success: true,
+      message: 'Commission transferred to wallet successfully',
+      commissionEarned: updatedData.commissionEarned,
+      walletBalance: updatedData.walletBalance
+    });
+  } catch (error) {
+    logger.error('Commission to wallet error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || 'Failed to transfer commission to wallet' 
+    });
+  }
+});
+
+// 8. Sell Airtime (Wallet or Customer)
+app.post('/api/driver-airtime/sell', async (req, res) => {
+  const { driverId, amount, recipientPhone, paymentMethod, customerPhone } = req.body;
+
+  if (!driverId || !amount || !recipientPhone || !paymentMethod) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Missing required fields' 
+    });
+  }
+
+  if (paymentMethod === 'customer' && !customerPhone) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Customer phone number required for customer payment method' 
+    });
+  }
+
+  try {
+    // Verify driver exists
+    const driverRef = firestore.collection('drivers').doc(driverId);
+    const driverDoc = await driverRef.get();
+    
+    if (!driverDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Driver not found' 
+      });
+    }
+
+    const driverData = driverDoc.data();
+    let transactionId = `DRIVER_AIRTIME_${Date.now()}_${driverId}`;
+
+    if (paymentMethod === 'wallet') {
+      // Check wallet balance
+      const currentBalance = driverData.walletBalance || 0;
+      if (currentBalance < amount) {
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Insufficient wallet balance' 
+        });
+      }
+
+      // Deduct from wallet and send airtime
+      await firestore.runTransaction(async (tx) => {
+        const updatedDriverDoc = await tx.get(driverRef);
+        const updatedDriverData = updatedDriverDoc.data();
+        
+        if (updatedDriverData.walletBalance < amount) {
+          throw new Error('Insufficient wallet balance');
+        }
+
+        // Deduct from wallet
+        tx.update(driverRef, {
+          walletBalance: FieldValue.increment(-amount),
+          totalTransactions: FieldValue.increment(1),
+          lastWalletUpdate: FieldValue.serverTimestamp()
+        });
+      });
+
+      // Send airtime
+      const carrier = detectCarrier(recipientPhone);
+      let airtimeResult;
+      
+      if (carrier === 'Safaricom') {
+        airtimeResult = await sendSafaricomAirtime(recipientPhone, amount);
+      } else {
+        airtimeResult = await sendAfricasTalkingAirtime(recipientPhone, amount, carrier);
+      }
+
+      if (airtimeResult.status === 'SUCCESS') {
+        // Award commission
+        const commissionDoc = await firestore.collection('wallet_bonuses').doc('drivers_com').get();
+        const commissionPercentage = commissionDoc.exists ? commissionDoc.data().percentage || 0 : 0;
+        const commissionAmount = amount * (commissionPercentage / 100);
+
+        await driverRef.update({
+          commissionEarned: FieldValue.increment(commissionAmount)
+        });
+
+        // Log successful transaction
+        await firestore.collection('transactions').add({
+          driverId,
+          type: 'DRIVER_AIRTIME_SALE',
+          amount: amount,
+          recipientPhone,
+          carrier,
+          commissionEarned: commissionAmount,
+          status: 'SUCCESS',
+          transactionId,
+          createdAt: FieldValue.serverTimestamp()
+        });
+
+        res.json({
+          success: true,
+          message: 'Airtime sent successfully',
+          transactionId,
+          commissionEarned: commissionAmount
+        });
+      } else {
+        // Refund wallet if airtime failed
+        await driverRef.update({
+          walletBalance: FieldValue.increment(amount),
+          totalTransactions: FieldValue.increment(-1)
+        });
+
+        res.json({
+          success: false,
+          message: 'Failed to send airtime',
+          transactionId
+        });
+      }
+    } else if (paymentMethod === 'customer') {
+      // Initiate STK Push to customer
+      const timestamp = generateTimestamp();
+      const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
+      const token = await getAccessToken();
+
+      const payload = {
+        BusinessShortCode: SHORTCODE,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: 'CustomerPayBillOnline',
+        Amount: Number(amount),
+        PartyA: customerPhone,
+        PartyB: SHORTCODE,
+        PhoneNumber: customerPhone,
+        CallBackURL: STK_CALLBACK_URL,
+        AccountReference: `DRIVER_AIRTIME_${driverId}_${recipientPhone}`,
+        TransactionDesc: 'Driver Airtime Sale'
+      };
+
+      const stkRes = await axios.post(
+        'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+        payload,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      // Log pending transaction
+      await firestore.collection('transactions').add({
+        driverId,
+        type: 'DRIVER_AIRTIME_SALE_PENDING',
+        amount: amount,
+        recipientPhone,
+        customerPhone,
+        status: 'PENDING',
+        transactionId,
+        merchantRequestID: stkRes.data.MerchantRequestID,
+        checkoutRequestID: stkRes.data.CheckoutRequestID,
+        createdAt: FieldValue.serverTimestamp()
+      });
+
+      res.json({
+        success: true,
+        message: 'STK Push initiated for customer payment',
+        transactionId,
+        merchantRequestID: stkRes.data.MerchantRequestID,
+        checkoutRequestID: stkRes.data.CheckoutRequestID
+      });
+    }
+  } catch (error) {
+    logger.error('Driver airtime sale error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || 'Failed to process airtime sale' 
+    });
+  }
+});
+
+// 9. Get Driver Transactions
+app.get('/api/driver-transactions/:driverId', async (req, res) => {
+  const { driverId } = req.params;
+
+  try {
+    // Verify driver exists
+    const driverDoc = await firestore.collection('drivers').doc(driverId).get();
+    if (!driverDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Driver not found' 
+      });
+    }
+
+    // Get driver's transactions
+    const transactionsSnapshot = await firestore.collection('transactions')
+      .where('driverId', '==', driverId)
+      .orderBy('createdAt', 'desc')
+      .limit(50)
+      .get();
+
+    const transactions = transactionsSnapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        transactionId: data.transactionId || doc.id,
+        type: data.type,
+        amount: data.amount,
+        date: data.createdAt,
+        status: data.status,
+        recipientPhone: data.recipientPhone,
+        commissionEarned: data.commissionEarned
+      };
+    });
+
+    res.json({
+      success: true,
+      transactions
+    });
+  } catch (error) {
+    logger.error('Get driver transactions error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to get driver transactions' 
+    });
+  }
+});
+
+// 10. Get Driver Profile
+app.get('/api/driver-profile/:driverId', async (req, res) => {
+  const { driverId } = req.params;
+
+  try {
+    const driverDoc = await firestore.collection('drivers').doc(driverId).get();
+    
+    if (!driverDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Driver not found' 
+      });
+    }
+
+    const driverData = driverDoc.data();
+    
+    res.json({
+      success: true,
+      profile: {
+        username: driverData.username,
+        email: driverData.email,
+        contactPerson: driverData.contactPerson,
+        phoneNumber: driverData.phoneNumber,
+        idNumber: driverData.idNumber
+      }
+    });
+  } catch (error) {
+    logger.error('Get driver profile error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to get driver profile' 
+    });
+  }
+});
+
+// 11. Update Driver Profile
+app.put('/api/driver-profile/:driverId', async (req, res) => {
+  const { driverId } = req.params;
+  const { username, contactPerson, phoneNumber, idNumber } = req.body;
+
+  if (!username || !contactPerson || !phoneNumber || !idNumber) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'All fields are required' 
+    });
+  }
+
+  try {
+    const driverRef = firestore.collection('drivers').doc(driverId);
+    const driverDoc = await driverRef.get();
+    
+    if (!driverDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Driver not found' 
+      });
+    }
+
+    // Update driver profile
+    await driverRef.update({
+      username,
+      contactPerson,
+      phoneNumber,
+      idNumber
+    });
+
+    res.json({
+      success: true,
+      message: 'Driver profile updated successfully'
+    });
+  } catch (error) {
+    logger.error('Update driver profile error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to update driver profile' 
+    });
+  }
+});
+
+// --- END DRIVER ENDPOINTS ---
+
 // Start the server
 app.listen(PORT, () => {
     logger.info(`Server running on port ${PORT}`);
@@ -2403,26 +3189,24 @@ app.post('/api/bulk-airtime', async (req, res) => {
     return res.status(400).json({ error: 'totalAmount does not match sum of request amounts.' });
   }
 
-  // Get user data to extract organization name
+  // Get user data to extract organization name and check wallet balance
   let organizationName = 'unknown';
+  let userData = null;
+  let userRef = null;
+  
   try {
-    const userDoc = await firestore.collection('users').doc(userId).get();
-    if (userDoc.exists) {
-      const userData = userDoc.data();
-      organizationName = userData.organizationName || userData.orgName || 'unknown';
+    // Bulk airtime is only for organisations
+    const organisationsDoc = await firestore.collection('organisations').doc(userId).get();
+    
+    if (!organisationsDoc.exists) {
+      return res.status(400).json({ error: 'Bulk airtime is only available for organisations. User not found in organisations collection.' });
     }
-  } catch (err) {
-    console.error('Failed to get user data:', err);
-  }
-
-  // Check wallet balance before creating job (but don't deduct yet)
-  try {
-    const userRef = firestore.collection('users').doc(userId);
-    const userDoc = await userRef.get();
-    if (!userDoc.exists) {
-      return res.status(400).json({ error: 'User not found.' });
-    }
-    const userData = userDoc.data();
+    
+    userData = organisationsDoc.data();
+    userRef = organisationsDoc.ref;
+    organizationName = userData.organizationName || userData.orgName || 'unknown';
+    
+    // Check wallet balance
     const currentBalance = userData.walletBalance || 0;
     if (currentBalance < totalAmount) {
       return res.status(400).json({ error: 'Insufficient wallet balance.' });
@@ -2651,7 +3435,15 @@ async function processBulkAirtimeJobs() {
         logger.info(`💰 Deducting wallet for successful sends - jobId: ${jobId}, successfulCount: ${successfulResults.length}, totalAmount: ${totalSuccessfulAmount}`);
         
         try {
-          const userRef = firestore.collection('users').doc(userId);
+          // Bulk airtime is only for organisations
+          const organisationsDoc = await firestore.collection('organisations').doc(userId).get();
+          
+          if (!organisationsDoc.exists) {
+            throw new Error('User not found in organisations collection during wallet deduction.');
+          }
+          
+          const userRef = organisationsDoc.ref;
+          
           await firestore.runTransaction(async (tx) => {
             const userDoc = await tx.get(userRef);
             if (!userDoc.exists) {
@@ -2744,7 +3536,7 @@ app.post('/api/mpesa/stkpush', async (req, res) => {
 
 // --- SINGLE AIRTIME ENDPOINT ---
 app.post('/api/single-airtime', async (req, res) => {
-  const { requests, totalAmount, userId } = req.body;
+  const { requests, totalAmount, userId, userType } = req.body;
   
   if (!Array.isArray(requests) || requests.length !== 1 || !totalAmount || !userId) {
     return res.status(400).json({ error: 'Invalid request format. Expected single airtime request.' });
@@ -2756,28 +3548,46 @@ app.post('/api/single-airtime', async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields: phoneNumber, amount, telco.' });
   }
 
-  // Get user data to extract organization name
+  // Get user data to extract organization/shop/username and deduct wallet balance
   let organizationName = 'unknown';
+  let userData = null;
+  let userRef = null;
+  let detectedUserType = null;
+  
   try {
-    const userDoc = await firestore.collection('users').doc(userId).get();
-    if (userDoc.exists) {
-      const userData = userDoc.data();
-      organizationName = userData.organizationName || userData.orgName || 'unknown';
+    // Check both retailers and drivers collections
+    const [retailersDoc, driversDoc] = await Promise.all([
+      firestore.collection('retailers').doc(userId).get(),
+      firestore.collection('drivers').doc(userId).get()
+    ]);
+    
+    if (retailersDoc.exists) {
+      userData = retailersDoc.data();
+      userRef = retailersDoc.ref;
+      detectedUserType = 'retailer';
+      // Retailers have shopName
+      organizationName = userData.shopName || userData.organizationName || 'unknown';
+    } else if (driversDoc.exists) {
+      userData = driversDoc.data();
+      userRef = driversDoc.ref;
+      detectedUserType = 'driver';
+      // Drivers have username
+      organizationName = userData.username || userData.organizationName || 'unknown';
+    } else {
+      return res.status(400).json({ error: 'Single airtime is only available for drivers and retailers. User not found in either collection.' });
     }
-  } catch (err) {
-    console.error('Failed to get user data:', err);
-  }
-
-  // Deduct wallet balance before sending airtime
-  try {
-    const userRef = firestore.collection('users').doc(userId);
-    let userData;
+    
+    // Validate userType if provided
+    if (userType && userType !== detectedUserType) {
+      console.warn(`User type mismatch: expected ${userType}, detected ${detectedUserType} for userId: ${userId}`);
+    }
+    
+    // Deduct wallet balance before sending airtime
     await firestore.runTransaction(async (tx) => {
       const userDoc = await tx.get(userRef);
       if (!userDoc.exists) {
         throw new Error('User not found.');
       }
-      userData = userDoc.data();
       const currentBalance = userData.walletBalance || 0;
       if (currentBalance < totalAmount) {
         throw new Error('Insufficient wallet balance.');
@@ -2829,16 +3639,36 @@ app.post('/api/single-airtime', async (req, res) => {
     message = err.message || 'Exception during airtime dispatch';
   }
 
+  // Handle commission for drivers on successful airtime sends
+  if (status === 'SUCCESS' && detectedUserType === 'driver') {
+    try {
+      // Award commission to driver
+      const commissionDoc = await firestore.collection('wallet_bonuses').doc('drivers_com').get();
+      const commissionPercentage = commissionDoc.exists ? commissionDoc.data().percentage || 0 : 0;
+      const commissionAmount = amount * (commissionPercentage / 100);
+      
+      if (commissionAmount > 0) {
+        await userRef.update({
+          commissionEarned: FieldValue.increment(commissionAmount)
+        });
+        console.log(`✅ Commission awarded to driver ${userId}: ${commissionAmount} KES`);
+      }
+    } catch (err) {
+      console.error('❌ Failed to award commission to driver:', err);
+    }
+  }
+
   // Create single sale record for successful airtime sends
   if (status === 'SUCCESS') {
     const saleId = `SINGLE_SALE_${Date.now()}`;
-    logger.info(`🔄 Attempting to write single sale for org: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`);
+    logger.info(`🔄 Attempting to write single sale for ${detectedUserType}: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`);
     
     try {
       await singleSalesCollection.doc(organizationName).collection('sales').doc(saleId).set({
         saleId,
         type: 'SINGLE_AIRTIME_SALE',
         userId,
+        userType: detectedUserType,
         organizationName,
         phoneNumber,
         amount,
@@ -2850,16 +3680,17 @@ app.post('/api/single-airtime', async (req, res) => {
         createdAt: FieldValue.serverTimestamp(),
         lastUpdated: FieldValue.serverTimestamp()
       });
-      logger.info(`✅ Successfully wrote single sale for org: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`);
+      logger.info(`✅ Successfully wrote single sale for ${detectedUserType}: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`);
     } catch (err) {
-      logger.error(`❌ Failed to write single sale for org: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`, { 
+      logger.error(`❌ Failed to write single sale for ${detectedUserType}: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`, { 
         error: err.message, 
         stack: err.stack,
         organizationName,
         saleId,
         phoneNumber,
         amount,
-        userId
+        userId,
+        userType: detectedUserType
       });
     }
   } else {
@@ -2872,11 +3703,13 @@ app.post('/api/single-airtime', async (req, res) => {
     message,
     phoneNumber,
     amount,
-    telco
+    telco,
+    userType: detectedUserType
   });
-});
-
+}); 
 // --- ADMIN BULK OPERATIONS ENDPOINTS ---
+
+// --- ADMIN BULK ENDPOINTS (CORPORATE USERS ONLY) ---
 
 // Get all bulk transactions for admin
 app.get('/api/admin/bulk-transactions', async (req, res) => {
@@ -2893,6 +3726,7 @@ app.get('/api/admin/bulk-transactions', async (req, res) => {
       query = query.where('status', '==', status);
     }
     if (organizationName) {
+      // Ensure we're filtering by the correct organization name field
       query = query.where('organizationName', '==', organizationName);
     }
     if (startDate && endDate) {
@@ -2911,6 +3745,13 @@ app.get('/api/admin/bulk-transactions', async (req, res) => {
 
     for (const doc of snapshot.docs) {
       const data = doc.data();
+      
+      // Validate that this is a corporate transaction
+      if (!data.organizationName) {
+        console.warn(`Transaction ${doc.id} missing organizationName, skipping...`);
+        continue;
+      }
+      
       transactions.push({
         id: doc.id,
         ...data,
@@ -2958,7 +3799,7 @@ app.get('/api/admin/bulk-sales', async (req, res) => {
         lastUpdated: doc.data().lastUpdated?.toDate?.() || doc.data().lastUpdated
       }));
     } else {
-      // Get all sales from all organizations
+      // Get all sales from all organizations (corporate users only)
       const orgsSnapshot = await bulkSalesCollection.get();
       for (const orgDoc of orgsSnapshot.docs) {
         const salesSnapshot = await orgDoc.ref.collection('sales')
@@ -3021,6 +3862,11 @@ app.get('/api/admin/bulk-transactions/:transactionId', async (req, res) => {
 
     const transactionData = transactionDoc.data();
     
+    // Validate this is a corporate transaction
+    if (!transactionData.organizationName) {
+      return res.status(400).json({ error: 'Invalid transaction: missing organization name' });
+    }
+    
     // Get associated sales
     const salesSnapshot = await bulkSalesCollection.doc(transactionData.organizationName)
       .collection('sales')
@@ -3056,7 +3902,7 @@ app.get('/api/admin/bulk-statistics', async (req, res) => {
     const start = startDate ? new Date(startDate) : new Date(new Date().setDate(new Date().getDate() - 30));
     const end = endDate ? new Date(endDate) : new Date();
 
-    // Get transactions in date range
+    // Get transactions in date range (corporate users only)
     const transactionsSnapshot = await bulkTransactionsCollection
       .where('createdAt', '>=', start)
       .where('createdAt', '<=', end)
@@ -3070,7 +3916,7 @@ app.get('/api/admin/bulk-statistics', async (req, res) => {
     const completedTransactions = transactions.filter(tx => tx.status === 'COMPLETED').length;
     const pendingTransactions = transactions.filter(tx => tx.status === 'PENDING_PROCESSING').length;
     
-    // Get organization breakdown
+    // Get organization breakdown (corporate organizations only)
     const orgBreakdown = {};
     transactions.forEach(tx => {
       const org = tx.organizationName || 'unknown';
@@ -3098,7 +3944,7 @@ app.get('/api/admin/bulk-statistics', async (req, res) => {
   }
 });
 
-// --- USER BULK HISTORY ENDPOINTS ---
+// --- USER BULK HISTORY ENDPOINTS (CORPORATE USERS ONLY) ---
 
 // Get user's bulk airtime history
 app.get('/api/user/bulk-history/:userId', async (req, res) => {
@@ -3108,6 +3954,15 @@ app.get('/api/user/bulk-history/:userId', async (req, res) => {
     const pageNumber = parseInt(page);
     const pageSize = parseInt(limit);
     const offset = (pageNumber - 1) * pageSize;
+
+    // Verify user is a corporate user
+    const userDoc = await firestore.collection('organisations').doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(403).json({ error: 'Access denied. Bulk airtime is only available for corporate users.' });
+    }
+
+    const userData = userDoc.data();
+    const organizationName = userData.organizationName;
 
     // Get user's bulk transactions
     let transactionsQuery = bulkTransactionsCollection
@@ -3137,11 +3992,10 @@ app.get('/api/user/bulk-history/:userId', async (req, res) => {
       });
     }
 
-    // Get user's bulk sales
+    // Get user's bulk sales (using organization name)
     const userSales = [];
-    const orgsSnapshot = await bulkSalesCollection.get();
-    for (const orgDoc of orgsSnapshot.docs) {
-      const salesSnapshot = await orgDoc.ref.collection('sales')
+    if (organizationName) {
+      const salesSnapshot = await bulkSalesCollection.doc(organizationName).collection('sales')
         .where('userId', '==', userId)
         .orderBy('createdAt', 'desc')
         .get();
@@ -3209,6 +4063,15 @@ app.get('/api/user/bulk-transactions/:transactionId', async (req, res) => {
     const { transactionId } = req.params;
     const { userId } = req.query; // For security, verify user owns this transaction
 
+    // Verify user is a corporate user
+    const userDoc = await firestore.collection('organisations').doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(403).json({ error: 'Access denied. Bulk airtime is only available for corporate users.' });
+    }
+
+    const userData = userDoc.data();
+    const organizationName = userData.organizationName;
+
     const transactionDoc = await bulkTransactionsCollection.doc(transactionId).get();
     if (!transactionDoc.exists) {
       return res.status(404).json({ error: 'Bulk transaction not found' });
@@ -3221,8 +4084,13 @@ app.get('/api/user/bulk-transactions/:transactionId', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
+    // Validate organization name matches
+    if (transactionData.organizationName !== organizationName) {
+      return res.status(403).json({ error: 'Organization mismatch' });
+    }
+
     // Get associated sales
-    const salesSnapshot = await bulkSalesCollection.doc(transactionData.organizationName)
+    const salesSnapshot = await bulkSalesCollection.doc(organizationName)
       .collection('sales')
       .where('jobId', '==', transactionData.jobId)
       .where('userId', '==', userId)
@@ -3272,6 +4140,15 @@ app.get('/api/user/bulk-statistics/:userId', async (req, res) => {
     const start = startDate ? new Date(startDate) : new Date(new Date().setDate(new Date().getDate() - 30));
     const end = endDate ? new Date(endDate) : new Date();
 
+    // Verify user is a corporate user
+    const userDoc = await firestore.collection('organisations').doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(403).json({ error: 'Access denied. Bulk airtime is only available for corporate users.' });
+    }
+
+    const userData = userDoc.data();
+    const organizationName = userData.organizationName;
+
     // Get user's transactions in date range
     const transactionsSnapshot = await bulkTransactionsCollection
       .where('userId', '==', userId)
@@ -3281,11 +4158,10 @@ app.get('/api/user/bulk-statistics/:userId', async (req, res) => {
 
     const transactions = transactionsSnapshot.docs.map(doc => doc.data());
 
-    // Get user's sales in date range
+    // Get user's sales in date range (using organization name)
     const userSales = [];
-    const orgsSnapshot = await bulkSalesCollection.get();
-    for (const orgDoc of orgsSnapshot.docs) {
-      const salesSnapshot = await orgDoc.ref.collection('sales')
+    if (organizationName) {
+      const salesSnapshot = await bulkSalesCollection.doc(organizationName).collection('sales')
         .where('userId', '==', userId)
         .where('createdAt', '>=', start)
         .where('createdAt', '<=', end)
@@ -3318,4 +4194,4 @@ app.get('/api/user/bulk-statistics/:userId', async (req, res) => {
     console.error('Error fetching user bulk statistics:', error);
     res.status(500).json({ error: 'Failed to fetch user bulk statistics' });
   }
-});
+}); 
