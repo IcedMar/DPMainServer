@@ -134,7 +134,8 @@ const allowedOrigins = [
     'https://www.daimapay.com',
     'https://daimapay-51406.web.app',
     'https://daimapay.web.app',
-    'https://daimapay-wallet.web.app'
+    'https://daimapay-wallet.web.app',
+    'https://new-wallet.web.app'
 ];
 app.use(cors({
     origin: function (origin, callback) {
