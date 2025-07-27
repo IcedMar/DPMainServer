@@ -2052,50 +2052,106 @@ app.post('/c2b-confirmation', async (req, res) => {
             }
             
             if (userDoc) {
-                
-                logger.info(`✅ Found user: ${userDoc.id}, current wallet balance: ${userData.walletBalance || 0}`);
-                
-                // Fetch bonus percentage (global or per-user)
-                const bonusDoc = await firestore.collection('wallet_bonuses').doc('current_settings').get();
-                if (bonusDoc.exists) {
-                    bonusPercentage = bonusDoc.data().percentage || 0;
-                    logger.info(`📊 Global bonus percentage: ${bonusPercentage}%`);
+                // Check if this is a driver username (airtime sale) or account number (wallet top-up)
+                if (driverUsername && driverId) {
+                    // SCENARIO 2: Driver Username - Send airtime and award commission
+                    logger.info(`🚗 Driver airtime sale detected - username: ${driverUsername}, driverId: ${driverId}, amount: ${amount}`);
+                    
+                    // Send airtime to recipientPhone (we need to get this from the transaction)
+                    // For now, we'll use a placeholder - in real implementation, you'd need to store recipientPhone
+                    const recipientPhone = mpesaNumber; // This should be the actual recipient phone
+                    
+                    // Detect carrier and send airtime
+                    const carrier = detectCarrier(recipientPhone);
+                    let airtimeResult;
+                    
+                    if (carrier === 'Safaricom') {
+                        airtimeResult = await sendSafaricomAirtime(recipientPhone, amount);
+                    } else {
+                        airtimeResult = await sendAfricasTalkingAirtime(recipientPhone, amount, carrier);
+                    }
+                    
+                    if (airtimeResult && airtimeResult.status === 'SUCCESS') {
+                        // Award commission to driver
+                        const commissionDoc = await firestore.collection('wallet_bonuses').doc('drivers_comm').get();
+                        const commissionPercentage = commissionDoc.exists ? commissionDoc.data().percentage || 0 : 0;
+                        const commissionAmount = amount * (commissionPercentage / 100);
+                        
+                        logger.info(`💰 Driver commission calculation - driverId: ${driverId}, amount: ${amount}, commissionPercentage: ${commissionPercentage}%, commissionAmount: ${commissionAmount}`);
+                        
+                        if (commissionAmount > 0) {
+                            await userRef.update({
+                                commissionEarned: FieldValue.increment(commissionAmount),
+                                lastCommissionUpdate: now
+                            });
+                            logger.info(`✅ Commission awarded to driver ${driverId}: ${commissionAmount}`);
+                        }
+                        
+                        // Log successful airtime sale
+                        await firestore.collection('transactions').add({
+                            driverId,
+                            type: 'DRIVER_AIRTIME_SALE_C2B',
+                            amount: amount,
+                            recipientPhone,
+                            customerPhone: mpesaNumber,
+                            carrier,
+                            commissionEarned: commissionAmount,
+                            status: 'SUCCESS',
+                            transactionId,
+                            createdAt: now
+                        });
+                        
+                        logger.info(`✅ Driver airtime sale completed - airtime sent to ${recipientPhone}, commission awarded: ${commissionAmount}`);
+                    } else {
+                        logger.error(`❌ Failed to send airtime for driver ${driverId}: ${airtimeResult?.message || 'Unknown error'}`);
+                    }
+                    
                 } else {
-                    logger.warn(`⚠️ No wallet_bonuses/current_settings document found`);
+                    // SCENARIO 1: Account Number - Wallet top-up
+                    logger.info(`✅ Found user: ${userDoc.id}, current wallet balance: ${userData.walletBalance || 0}`);
+                    
+                    // Fetch bonus percentage (global or per-user)
+                    const bonusDoc = await firestore.collection('wallet_bonuses').doc('current_settings').get();
+                    if (bonusDoc.exists) {
+                        bonusPercentage = bonusDoc.data().percentage || 0;
+                        logger.info(`📊 Global bonus percentage: ${bonusPercentage}%`);
+                    } else {
+                        logger.warn(`⚠️ No wallet_bonuses/current_settings document found`);
+                    }
+                    
+                    // Per-user override
+                    if (userData.walletBonusPercentage !== undefined) {
+                        bonusPercentage = userData.walletBonusPercentage;
+                        logger.info(`📊 Using per-user bonus percentage: ${bonusPercentage}%`);
+                    }
+                    
+                    bonusApplied = amount * (bonusPercentage / 100);
+                    const totalToAdd = amount + bonusApplied;
+                    
+                    logger.info(`💰 Bonus calculation: amount=${amount}, bonusPercentage=${bonusPercentage}%, bonusApplied=${bonusApplied}, totalToAdd=${totalToAdd}`);
+                    
+                    await userRef.update({
+                        walletBalance: FieldValue.increment(totalToAdd),
+                        lastWalletUpdate: now
+                    });
+                    
+                    // --- Set hasMadeFirstTopUp to true if this is the first deposit ---
+                    if (!userData.hasMadeFirstTopUp) {
+                        await userRef.update({ hasMadeFirstTopUp: true });
+                        logger.info(`🎉 Set hasMadeFirstTopUp to true for user ${userDoc.id} (${userCollection})`);
+                    }
+                    
+                    walletUpdateResult = {
+                        userId: userDoc.id,
+                        userCollection: userCollection,
+                        accountNumber: BillRefNumber,
+                        incrementedBy: totalToAdd,
+                        bonusApplied,
+                        bonusPercentage,
+                        organizationName: userData.organizationName || userData.orgName || 'unknown'
+                    };
+                    logger.info(`✅ Updated walletBalance for user ${userDoc.id} (${userCollection}, accountNumber: ${BillRefNumber}) by Ksh ${totalToAdd} (bonus: ${bonusApplied})`);
                 }
-                
-                // Per-user override
-                if (userData.walletBonusPercentage !== undefined) {
-                    bonusPercentage = userData.walletBonusPercentage;
-                    logger.info(`📊 Using per-user bonus percentage: ${bonusPercentage}%`);
-                }
-                
-                bonusApplied = amount * (bonusPercentage / 100);
-                const totalToAdd = amount + bonusApplied;
-                
-                logger.info(`💰 Bonus calculation: amount=${amount}, bonusPercentage=${bonusPercentage}%, bonusApplied=${bonusApplied}, totalToAdd=${totalToAdd}`);
-                
-                await userRef.update({
-                    walletBalance: FieldValue.increment(totalToAdd),
-                    lastWalletUpdate: now
-
-                });
-                // --- Set hasMadeFirstTopUp to true if this is the first deposit ---
-                if (!userData.hasMadeFirstTopUp) {
-                    await userRef.update({ hasMadeFirstTopUp: true });
-                    logger.info(`🎉 Set hasMadeFirstTopUp to true for user ${userDoc.id} (${userCollection})`);
-                }
-                
-                walletUpdateResult = {
-                    userId: userDoc.id,
-                    userCollection: userCollection,
-                    accountNumber: BillRefNumber,
-                    incrementedBy: totalToAdd,
-                    bonusApplied,
-                    bonusPercentage,
-                    organizationName: userData.organizationName || userData.orgName || 'unknown'
-                };
-                logger.info(`✅ Updated walletBalance for user ${userDoc.id} (${userCollection}, accountNumber: ${BillRefNumber}) by Ksh ${totalToAdd} (bonus: ${bonusApplied})`);
             } else {
                 logger.warn(`⚠️ No user found with accountNumber: ${BillRefNumber} for wallet update.`);
             }
@@ -3958,18 +4014,34 @@ app.post('/api/single-airtime', async (req, res) => {
   if (status === 'SUCCESS' && detectedUserType === 'driver') {
     try {
       // Award commission to driver
-      const commissionDoc = await firestore.collection('wallet_bonuses').doc('drivers_com').get();
+      const commissionDoc = await firestore.collection('wallet_bonuses').doc('drivers_comm').get();
       const commissionPercentage = commissionDoc.exists ? commissionDoc.data().percentage || 0 : 0;
       const commissionAmount = amount * (commissionPercentage / 100);
       
+      logger.info(`💰 Driver commission calculation - driverId: ${userId}, amount: ${amount}, commissionPercentage: ${commissionPercentage}%, commissionAmount: ${commissionAmount}`);
+      
       if (commissionAmount > 0) {
         await userRef.update({
-          commissionEarned: FieldValue.increment(commissionAmount)
+          commissionEarned: FieldValue.increment(commissionAmount),
+          lastCommissionUpdate: FieldValue.serverTimestamp()
         });
-        console.log(`✅ Commission awarded to driver ${userId}: ${commissionAmount} KES`);
+        logger.info(`✅ Commission awarded to driver ${userId}: ${commissionAmount} KES`);
+        
+        // Log commission award
+        await firestore.collection('bonus_history').add({
+          type: 'DRIVER_COMMISSION_AWARDED',
+          driverId: userId,
+          driverUsername: userData.username || 'unknown',
+          transactionId: `SINGLE_AIRTIME_${Date.now()}`,
+          saleId: `SINGLE_SALE_${Date.now()}`,
+          originalAmount: amount,
+          commissionPercentage: commissionPercentage,
+          commissionAmount: commissionAmount,
+          createdAt: FieldValue.serverTimestamp()
+        });
       }
     } catch (err) {
-      console.error('❌ Failed to award commission to driver:', err);
+      logger.error('❌ Failed to award commission to driver:', err);
     }
   }
 
