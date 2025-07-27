@@ -3445,6 +3445,19 @@ async function processBulkAirtimeJobs() {
       const job = jobDoc.data();
       const jobId = jobDoc.id;
       let { requests, results = [], currentIndex = 0, status, organizationName, userId, totalAmount } = job;
+      
+      // Skip if already completed or processing
+      if (status === 'completed' || status === 'processing') {
+        logger.info(`⏭️ Skipping job ${jobId} - status: ${status}`);
+        continue;
+      }
+      
+      // Mark job as processing immediately to prevent race conditions
+      await bulkAirtimeJobsCollection.doc(jobId).update({
+        status: 'processing',
+        updatedAt: FieldValue.serverTimestamp()
+      });
+      
       if (!Array.isArray(requests) || currentIndex >= requests.length) {
         // Already done
         await bulkAirtimeJobsCollection.doc(jobId).update({
@@ -3481,6 +3494,14 @@ async function processBulkAirtimeJobs() {
       let processed = 0;
       while (currentIndex < requests.length && processed < 5) {
         const { phoneNumber, amount, telco, name } = requests[currentIndex];
+        
+        // Check if this recipient has already been processed
+        if (results[currentIndex] && results[currentIndex].status) {
+          logger.info(`⏭️ Skipping already processed recipient ${currentIndex + 1}/${requests.length} - phone: ${phoneNumber}, status: ${results[currentIndex].status}`);
+          currentIndex++;
+          continue;
+        }
+        
         let recipientStatus = 'FAILED';
         let message = '';
         let dispatchResult = null;
@@ -3573,37 +3594,45 @@ async function processBulkAirtimeJobs() {
         const successfulResults = results.filter(r => r.status === 'SUCCESS');
         const totalSuccessfulAmount = successfulResults.reduce((sum, r) => sum + Number(r.amount || 0), 0);
         
-        logger.info(`💰 Deducting wallet for successful sends - jobId: ${jobId}, successfulCount: ${successfulResults.length}, totalAmount: ${totalSuccessfulAmount}`);
+        // Check if wallet has already been deducted for this job
+        const jobData = await bulkAirtimeJobsCollection.doc(jobId).get();
+        const jobStatus = jobData.data()?.status;
         
-        try {
-          // Bulk airtime is only for organisations
-          const organisationsDoc = await firestore.collection('organisations').doc(userId).get();
+        if (jobStatus === 'completed') {
+          logger.warn(`⚠️ Job ${jobId} already completed, skipping wallet deduction`);
+        } else {
+          logger.info(`💰 Deducting wallet for successful sends - jobId: ${jobId}, successfulCount: ${successfulResults.length}, totalAmount: ${totalSuccessfulAmount}`);
           
-          if (!organisationsDoc.exists) {
-            throw new Error('User not found in organisations collection during wallet deduction.');
-          }
-          
-          const userRef = organisationsDoc.ref;
-          
-          await firestore.runTransaction(async (tx) => {
-            const userDoc = await tx.get(userRef);
-            if (!userDoc.exists) {
-              throw new Error('User not found during wallet deduction.');
+          try {
+            // Bulk airtime is only for organisations
+            const organisationsDoc = await firestore.collection('organisations').doc(userId).get();
+            
+            if (!organisationsDoc.exists) {
+              throw new Error('User not found in organisations collection during wallet deduction.');
             }
-            const userData = userDoc.data();
-            const currentBalance = userData.walletBalance || 0;
             
-            // Deduct only the amount for successful sends
-            tx.update(userRef, {
-              walletBalance: FieldValue.increment(-totalSuccessfulAmount),
-              lastWalletUpdate: FieldValue.serverTimestamp()
+            const userRef = organisationsDoc.ref;
+            
+            await firestore.runTransaction(async (tx) => {
+              const userDoc = await tx.get(userRef);
+              if (!userDoc.exists) {
+                throw new Error('User not found during wallet deduction.');
+              }
+              const userData = userDoc.data();
+              const currentBalance = userData.walletBalance || 0;
+              
+              // Deduct only the amount for successful sends
+              tx.update(userRef, {
+                walletBalance: FieldValue.increment(-totalSuccessfulAmount),
+                lastWalletUpdate: FieldValue.serverTimestamp()
+              });
+              
+              logger.info(`✅ Wallet deduction completed - userId: ${userId}, deductedAmount: ${totalSuccessfulAmount}, newBalance: ${currentBalance - totalSuccessfulAmount}`);
             });
-            
-            logger.info(`✅ Wallet deduction completed - userId: ${userId}, deductedAmount: ${totalSuccessfulAmount}, newBalance: ${currentBalance - totalSuccessfulAmount}`);
-          });
-        } catch (err) {
-          logger.error(`❌ Failed to deduct wallet for job ${jobId}:`, err);
-          // Continue with job completion even if wallet deduction fails
+          } catch (err) {
+            logger.error(`❌ Failed to deduct wallet for job ${jobId}:`, err);
+            // Continue with job completion even if wallet deduction fails
+          }
         }
         
         await bulkAirtimeJobsCollection.doc(jobId).update({
@@ -3619,6 +3648,24 @@ async function processBulkAirtimeJobs() {
   } catch (err) {
     logger.error('❌ Bulk airtime worker error:', err);
     console.error('Bulk airtime worker error:', err);
+    
+    // If there was an error, try to reset any stuck 'processing' jobs to 'pending'
+    try {
+      const stuckJobs = await bulkAirtimeJobsCollection
+        .where('status', '==', 'processing')
+        .where('updatedAt', '<', new Date(Date.now() - 5 * 60 * 1000)) // 5 minutes ago
+        .get();
+      
+      for (const stuckJob of stuckJobs.docs) {
+        await stuckJob.ref.update({
+          status: 'pending',
+          updatedAt: FieldValue.serverTimestamp()
+        });
+        logger.info(`🔄 Reset stuck job ${stuckJob.id} from processing to pending`);
+      }
+    } catch (resetError) {
+      logger.error('❌ Failed to reset stuck jobs:', resetError);
+    }
   }
 }
 setInterval(processBulkAirtimeJobs, BULK_AIRTIME_WORKER_INTERVAL);
