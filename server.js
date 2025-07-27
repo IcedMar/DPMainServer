@@ -125,6 +125,7 @@ const SHORTCODE = process.env.BUSINESS_SHORT_CODE; // Your Paybill/Till number
 const PASSKEY = process.env.PASSKEY;
 const STK_CALLBACK_URL = process.env.CALLBACK_URL; // Your public URL for /stk-callback
 const ANALYTICS_SERVER_URL = process.env.ANALYTICS_SERVER_URL; // Your analytics server URL
+const BASE_URL = process.env.CALLBACK_URL?.replace('/stk-callback', '') || 'https://daimaofflineserver.onrender.com'; // Fallback for BASE_URL
 
 // --- Middleware ---
 app.use(helmet());
