@@ -1092,8 +1092,24 @@ app.post('/stk-push', stkPushLimiter, async (req, res) => {
     try {
         const accessToken = await getAccessToken();
 
+        // Check if this is a driver request (has reference field with driver info)
+        let accountReference = cleanedRecipient;
+        if (reference && reference.startsWith('DRIVER_AIRTIME_')) {
+            // Extract driverId from reference
+            const parts = reference.split('_');
+            if (parts.length >= 3) {
+                const driverId = parts[2];
+                // Find driver and get username
+                const driverDoc = await firestore.collection('drivers').doc(driverId).get();
+                if (driverDoc.exists) {
+                    accountReference = driverDoc.data().username;
+                    logger.info(`🔄 Using driver username as AccountReference: ${accountReference} (from reference: ${reference})`);
+                }
+            }
+        }
+        
         // Truncate AccountReference to M-Pesa limits (max 20 characters)
-        const truncatedAccountRef = cleanedRecipient.length > 20 ? cleanedRecipient.substring(0, 20) : cleanedRecipient;
+        const truncatedAccountRef = accountReference.length > 20 ? accountReference.substring(0, 20) : accountReference;
         
         const stkPushPayload = {
             BusinessShortCode: SHORTCODE,
@@ -1105,7 +1121,7 @@ app.post('/stk-push', stkPushLimiter, async (req, res) => {
             PartyB: SHORTCODE, // Your Paybill/Till number
             PhoneNumber: cleanedCustomerPhone, // Customer's phone number
             CallBackURL: STK_CALLBACK_URL,
-            AccountReference: truncatedAccountRef, // Use truncated recipient number as account reference
+            AccountReference: truncatedAccountRef, // Use driver username or truncated recipient number
             TransactionDesc: `Airtime for ${cleanedRecipient}`
         };
         
@@ -3084,6 +3100,12 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
       const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
       const token = await getAccessToken();
 
+      // Use driverUsername as AccountReference (truncated if needed)
+      const driverUsername = req.body.driverUsername || driverData.username || 'driver';
+      const truncatedAccountRef = driverUsername.length > 20 ? driverUsername.substring(0, 20) : driverUsername;
+      
+      logger.info(`📝 Driver STK Push - driverUsername: ${driverUsername}, truncated: ${truncatedAccountRef}`);
+      
       const payload = {
         BusinessShortCode: SHORTCODE,
         Password: password,
@@ -3094,7 +3116,7 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
         PartyB: SHORTCODE,
         PhoneNumber: customerPhone,
         CallBackURL: STK_CALLBACK_URL,
-        AccountReference: `DRIVER_AIRTIME_${driverId}_${recipientPhone}`,
+        AccountReference: truncatedAccountRef,
         TransactionDesc: 'Driver Airtime Sale'
       };
 
