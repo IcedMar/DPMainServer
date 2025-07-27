@@ -2914,21 +2914,34 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
       const carrier = detectCarrier(recipientPhone);
       let airtimeResult;
       
+      logger.info(`📱 Sending airtime via driver wallet - driverId: ${driverId}, recipientPhone: ${recipientPhone}, amount: ${amount}, carrier: ${carrier}`);
+      
       if (carrier === 'Safaricom') {
         airtimeResult = await sendSafaricomAirtime(recipientPhone, amount);
       } else {
         airtimeResult = await sendAfricasTalkingAirtime(recipientPhone, amount, carrier);
       }
 
+      logger.info(`📱 Airtime send result - driverId: ${driverId}, status: ${airtimeResult.status}, message: ${airtimeResult.message}`);
+
       if (airtimeResult.status === 'SUCCESS') {
         // Award commission
-        const commissionDoc = await firestore.collection('wallet_bonuses').doc('drivers_com').get();
+        const commissionDoc = await firestore.collection('wallet_bonuses').doc('drivers_comm').get();
         const commissionPercentage = commissionDoc.exists ? commissionDoc.data().percentage || 0 : 0;
         const commissionAmount = amount * (commissionPercentage / 100);
 
-        await driverRef.update({
-          commissionEarned: FieldValue.increment(commissionAmount)
-        });
+        logger.info(`📊 Commission document check - exists: ${commissionDoc.exists}, percentage: ${commissionPercentage}%, document data: ${JSON.stringify(commissionDoc.exists ? commissionDoc.data() : 'N/A')}`);
+
+        logger.info(`💰 Driver commission calculation - driverId: ${driverId}, amount: ${amount}, commissionPercentage: ${commissionPercentage}%, commissionAmount: ${commissionAmount}`);
+
+        if (commissionAmount > 0) {
+          await driverRef.update({
+            commissionEarned: FieldValue.increment(commissionAmount)
+          });
+          logger.info(`✅ Commission awarded to driver ${driverId}: ${commissionAmount}`);
+        } else {
+          logger.warn(`⚠️ No commission awarded - percentage is 0 or document not found for driver ${driverId}`);
+        }
 
         // Log successful transaction
         await firestore.collection('transactions').add({
@@ -2947,7 +2960,8 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
           success: true,
           message: 'Airtime sent successfully',
           transactionId,
-          commissionEarned: commissionAmount
+          commissionEarned: commissionAmount,
+          commissionPercentage: commissionPercentage
         });
       } else {
         // Refund wallet if airtime failed
@@ -3020,6 +3034,43 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: error.message || 'Failed to process airtime sale' 
+    });
+  }
+});
+
+// 8.5. Check/Set Driver Commission Percentage
+app.get('/api/driver-commission-check', async (req, res) => {
+  try {
+    const commissionDoc = await firestore.collection('wallet_bonuses').doc('drivers_comm').get();
+    
+    if (!commissionDoc.exists) {
+      // Create the document with default 5% commission
+      await firestore.collection('wallet_bonuses').doc('drivers_comm').set({
+        percentage: 5,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp()
+      });
+      
+      logger.info('✅ Created drivers_comm document with 5% commission');
+      res.json({
+        success: true,
+        message: 'Created drivers_comm document with 5% commission',
+        percentage: 5
+      });
+    } else {
+      const data = commissionDoc.data();
+      res.json({
+        success: true,
+        message: 'Commission document exists',
+        percentage: data.percentage || 0,
+        data: data
+      });
+    }
+  } catch (error) {
+    logger.error('Driver commission check error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to check commission settings' 
     });
   }
 });
