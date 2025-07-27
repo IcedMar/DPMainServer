@@ -3775,19 +3775,13 @@ app.post('/api/driver/stkpush', async (req, res) => {
     const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
     const token = await getAccessToken();
 
-    // Handle AccountReference - if it's the long format, extract driverUsername, otherwise use as is
-    let accountReference = req.body.AccountReference || driverUsername;
-    
-    // If it's the long format (DRIVER_AIRTIME_${driverId}_${recipientPhone}), extract driverUsername
-    if (accountReference.startsWith('DRIVER_AIRTIME_')) {
-      accountReference = driverUsername;
-      logger.info(`🔄 Extracted driverUsername from long AccountReference: ${driverUsername}`);
-    }
+    // Always use driverUsername as AccountReference, regardless of what frontend sends
+    const accountReference = req.body.driverUsername;
     
     // Truncate to M-Pesa limits (max 20 characters)
     const truncatedAccountRef = accountReference.length > 20 ? accountReference.substring(0, 20) : accountReference;
     
-    logger.info(`📝 AccountReference processing - original: ${accountReference}, truncated: ${truncatedAccountRef}`);
+    logger.info(`📝 AccountReference processing - driverUsername: ${driverUsername}, truncated: ${truncatedAccountRef}`);
     
     const payload = {
       BusinessShortCode: SHORTCODE,
