@@ -2057,14 +2057,35 @@ app.post('/c2b-confirmation', async (req, res) => {
                     // SCENARIO 2: Driver Username - Send airtime and award commission
                     logger.info(`🚗 Driver airtime sale detected - username: ${driverUsername}, driverId: ${driverId}, amount: ${amount}`);
                     
-                    // Send airtime to recipientPhone (we need to get this from the transaction)
-                    // For now, we'll use a placeholder - in real implementation, you'd need to store recipientPhone
-                    const recipientPhone = mpesaNumber; // This should be the actual recipient phone
+                    // Find the pending transaction to get recipient phone
+                    const pendingTransactionSnap = await firestore.collection('transactions')
+                        .where('driverUsername', '==', driverUsername)
+                        .where('type', '==', 'DRIVER_AIRTIME_SALE_PENDING')
+                        .where('status', '==', 'PENDING')
+                        .orderBy('createdAt', 'desc')
+                        .limit(1)
+                        .get();
+                    
+                    let recipientPhone = null;
+                    if (!pendingTransactionSnap.empty) {
+                        const pendingTx = pendingTransactionSnap.docs[0].data();
+                        recipientPhone = pendingTx.recipientPhone;
+                        logger.info(`✅ Found pending transaction with recipientPhone: ${recipientPhone}`);
+                    } else {
+                        logger.warn(`⚠️ No pending transaction found for driver ${driverUsername}, using customer phone as fallback`);
+                        recipientPhone = mpesaNumber; // Fallback to customer phone
+                    }
+                    
+                    if (!recipientPhone) {
+                        logger.error(`❌ No recipient phone found for driver ${driverUsername}`);
+                        return res.json({ "ResultCode": 0, "ResultDesc": "No recipient phone found" });
+                    }
                     
                     // Detect carrier and send airtime
                     const carrier = detectCarrier(recipientPhone);
-                    let airtimeResult;
+                    logger.info(`📱 Sending airtime to ${recipientPhone}, carrier: ${carrier}, amount: ${amount}`);
                     
+                    let airtimeResult;
                     if (carrier === 'Safaricom') {
                         airtimeResult = await sendSafaricomAirtime(recipientPhone, amount);
                     } else {
@@ -2087,7 +2108,43 @@ app.post('/c2b-confirmation', async (req, res) => {
                             logger.info(`✅ Commission awarded to driver ${driverId}: ${commissionAmount}`);
                         }
                         
-                        // Log successful airtime sale
+                        // Log successful airtime sale in single_sales collection
+                        const saleId = `SINGLE_SALE_${Date.now()}_${driverId}`;
+                        const organizationName = userData.username || 'unknown';
+                        
+                        try {
+                            await firestore.collection('single_sales').doc(organizationName).collection('sales').doc(saleId).set({
+                                saleId,
+                                type: 'DRIVER_AIRTIME_SALE_C2B',
+                                userId: driverId,
+                                userType: 'driver',
+                                organizationName,
+                                phoneNumber: recipientPhone,
+                                amount,
+                                telco: carrier,
+                                recipientName: '',
+                                status: 'SUCCESS',
+                                message: 'Airtime sent via C2B confirmation',
+                                commissionEarned: commissionAmount,
+                                customerPhone: mpesaNumber,
+                                transactionId,
+                                createdAt: now,
+                                lastUpdated: now
+                            });
+                            logger.info(`✅ Successfully wrote single sale for driver: ${organizationName}, saleId: ${saleId}, phoneNumber: ${recipientPhone}, amount: ${amount}`);
+                        } catch (err) {
+                            logger.error(`❌ Failed to write single sale for driver: ${organizationName}, saleId: ${saleId}`, { 
+                                error: err.message, 
+                                stack: err.stack,
+                                organizationName,
+                                saleId,
+                                phoneNumber: recipientPhone,
+                                amount,
+                                driverId
+                            });
+                        }
+                        
+                        // Also log in transactions collection for tracking
                         await firestore.collection('transactions').add({
                             driverId,
                             type: 'DRIVER_AIRTIME_SALE_C2B',
@@ -2098,6 +2155,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                             commissionEarned: commissionAmount,
                             status: 'SUCCESS',
                             transactionId,
+                            saleId,
                             createdAt: now
                         });
                         
@@ -3187,7 +3245,7 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
         }
       );
 
-      // Log pending transaction
+      // Log pending transaction with recipient phone for C2B retrieval
       await firestore.collection('transactions').add({
         driverId,
         type: 'DRIVER_AIRTIME_SALE_PENDING',
@@ -3198,6 +3256,7 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
         transactionId,
         merchantRequestID: stkRes.data.MerchantRequestID,
         checkoutRequestID: stkRes.data.CheckoutRequestID,
+        driverUsername: driverData.username,
         createdAt: FieldValue.serverTimestamp()
       });
 
