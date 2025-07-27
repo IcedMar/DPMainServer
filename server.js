@@ -1042,6 +1042,16 @@ const stkCallbackRateLimiter = rateLimit({
 app.post('/stk-push', stkPushLimiter, async (req, res) => {
     const { amount, phoneNumber, recipient, customerName, serviceType, reference } = req.body; // Added customerName, serviceType, reference for completeness
 
+    logger.info('🚀 STK Push endpoint called - /stk-push', { 
+        amount, 
+        phoneNumber, 
+        recipient, 
+        customerName, 
+        serviceType, 
+        reference,
+        body: req.body 
+    });
+
     if (!amount || !phoneNumber || !recipient) {
         logger.warn('Missing required parameters for STK Push:', { amount, phoneNumber, recipient });
         return res.status(400).json({ success: false, message: 'Missing required parameters: amount, phoneNumber, recipient.' });
@@ -1098,6 +1108,8 @@ app.post('/stk-push', stkPushLimiter, async (req, res) => {
             AccountReference: truncatedAccountRef, // Use truncated recipient number as account reference
             TransactionDesc: `Airtime for ${cleanedRecipient}`
         };
+        
+        logger.info('📤 STK Push payload being sent to M-Pesa:', stkPushPayload);
 
         const stkPushResponse = await axios.post(
             'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
@@ -3674,6 +3686,14 @@ setInterval(processBulkAirtimeJobs, BULK_AIRTIME_WORKER_INTERVAL);
 // --- STK PUSH INITIATION ENDPOINT ---
 app.post('/api/mpesa/stkpush', async (req, res) => {
   const { amount, phoneNumber, accountNumber } = req.body;
+  
+  logger.info('🚀 STK Push endpoint called - /api/mpesa/stkpush', { 
+    amount, 
+    phoneNumber, 
+    accountNumber,
+    body: req.body 
+  });
+  
   if (!amount || !phoneNumber || !accountNumber) {
     return res.status(400).json({ error: 'Missing required fields.' });
   }
@@ -3701,6 +3721,8 @@ app.post('/api/mpesa/stkpush', async (req, res) => {
       AccountReference: truncatedAccountRef,
       TransactionDesc: 'Wallet Top Up'
     };
+    
+    logger.info('📤 STK Push payload being sent to M-Pesa:', payload);
 
     const stkRes = await axios.post(
       'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
@@ -3729,6 +3751,15 @@ app.post('/api/mpesa/stkpush', async (req, res) => {
 app.post('/api/driver/stkpush', async (req, res) => {
   const { amount, customerPhone, driverUsername, recipientPhone, telco } = req.body;
   
+  logger.info('🚀 STK Push endpoint called - /api/driver/stkpush', { 
+    amount, 
+    customerPhone, 
+    driverUsername, 
+    recipientPhone, 
+    telco,
+    body: req.body 
+  });
+  
   if (!amount || !customerPhone || !driverUsername || !recipientPhone || !telco) {
     return res.status(400).json({ error: 'Missing required fields: amount, customerPhone, driverUsername, recipientPhone, telco.' });
   }
@@ -3744,8 +3775,19 @@ app.post('/api/driver/stkpush', async (req, res) => {
     const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
     const token = await getAccessToken();
 
-    // Use driver username as AccountReference (truncated to 20 chars)
-    const truncatedDriverUsername = driverUsername.length > 20 ? driverUsername.substring(0, 20) : driverUsername;
+    // Handle AccountReference - if it's the long format, extract driverUsername, otherwise use as is
+    let accountReference = req.body.AccountReference || driverUsername;
+    
+    // If it's the long format (DRIVER_AIRTIME_${driverId}_${recipientPhone}), extract driverUsername
+    if (accountReference.startsWith('DRIVER_AIRTIME_')) {
+      accountReference = driverUsername;
+      logger.info(`🔄 Extracted driverUsername from long AccountReference: ${driverUsername}`);
+    }
+    
+    // Truncate to M-Pesa limits (max 20 characters)
+    const truncatedAccountRef = accountReference.length > 20 ? accountReference.substring(0, 20) : accountReference;
+    
+    logger.info(`📝 AccountReference processing - original: ${accountReference}, truncated: ${truncatedAccountRef}`);
     
     const payload = {
       BusinessShortCode: SHORTCODE,
@@ -3757,9 +3799,11 @@ app.post('/api/driver/stkpush', async (req, res) => {
       PartyB: SHORTCODE,
       PhoneNumber: customerPhone,
       CallBackURL: STK_CALLBACK_URL,
-      AccountReference: truncatedDriverUsername,
+      AccountReference: truncatedAccountRef,
       TransactionDesc: 'Driver Airtime Sale'
     };
+    
+    logger.info('📤 Driver STK Push payload being sent to M-Pesa:', payload);
 
     const stkRes = await axios.post(
       'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
