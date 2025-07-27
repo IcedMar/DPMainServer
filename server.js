@@ -2973,8 +2973,6 @@ app.post('/api/driver-commission/withdraw', async (req, res) => {
         Initiator: 'DaimaPay',
         CommandID: 'TransactionReversal',
         TransactionID: `COMMISSION_${driverId}_${Date.now()}`,
-        QueueTimeOutURL: `${BASE_URL}/api/mpesa/timeout`,
-        ResultURL: `${BASE_URL}/api/mpesa/result`,
         Occasion: 'Commission Withdrawal'
       };
 
