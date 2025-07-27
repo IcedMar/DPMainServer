@@ -2955,32 +2955,28 @@ app.post('/api/driver-commission/withdraw', async (req, res) => {
         commissionEarned: FieldValue.increment(-amount)
       });
 
-      // Initiate C2B Reversal to driver's phone number (system pays driver)
+      // Initiate B2C (Business to Customer) payment to driver's phone number
       const timestamp = generateTimestamp();
       const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
       const token = await getAccessToken();
 
       const payload = {
-        BusinessShortCode: SHORTCODE,
-        Password: password,
-        Timestamp: timestamp,
-        TransactionType: 'Reversal',
+        InitiatorName: 'DaimaPay',
+        SecurityCredential: generateSecurityCredential(PASSKEY),
+        CommandID: 'BusinessPayment',
         Amount: Number(amount),
-        PartyA: SHORTCODE, // Paybill (system)
+        PartyA: SHORTCODE, // Business shortcode
         PartyB: phoneNumber, // Driver's phone number
-        ReceiverParty: phoneNumber, // Driver's phone number
-        RecieverIdentifierType: 1, // MSISDN
         Remarks: `Commission withdrawal for driver ${driverId}`,
-        Initiator: 'DaimaPay',
-        CommandID: 'TransactionReversal',
-        TransactionID: `COMMISSION_${driverId}_${Date.now()}`,
+        QueueTimeOutURL: `${BASE_URL}/api/mpesa/timeout`,
+        ResultURL: `${BASE_URL}/api/mpesa/result`,
         Occasion: 'Commission Withdrawal'
       };
 
-      logger.info(`💰 Initiating commission withdrawal - driverId: ${driverId}, amount: ${amount}, phoneNumber: ${phoneNumber}`);
+      logger.info(`💰 Initiating B2C commission withdrawal - driverId: ${driverId}, amount: ${amount}, phoneNumber: ${phoneNumber}`);
 
-      const reversalRes = await axios.post(
-        'https://api.safaricom.co.ke/mpesa/reversal/v1/request',
+      const b2cRes = await axios.post(
+        'https://api.safaricom.co.ke/mpesa/b2c/v1/paymentrequest',
         payload,
         {
           headers: {
@@ -2990,7 +2986,7 @@ app.post('/api/driver-commission/withdraw', async (req, res) => {
         }
       );
 
-      logger.info(`✅ Commission withdrawal initiated - response: ${JSON.stringify(reversalRes.data)}`);
+      logger.info(`✅ B2C commission withdrawal initiated - response: ${JSON.stringify(b2cRes.data)}`);
 
       // Log transaction
       await firestore.collection('transactions').add({
@@ -2999,8 +2995,9 @@ app.post('/api/driver-commission/withdraw', async (req, res) => {
         amount: -amount,
         phoneNumber,
         status: 'PENDING',
-        reversalRequestID: reversalRes.data.ResponseCode,
-        transactionID: payload.TransactionID,
+        b2cRequestID: b2cRes.data.ResponseCode,
+        conversationID: b2cRes.data.ConversationID,
+        originatorConversationID: b2cRes.data.OriginatorConversationID,
         createdAt: FieldValue.serverTimestamp()
       });
 
@@ -3008,8 +3005,9 @@ app.post('/api/driver-commission/withdraw', async (req, res) => {
         success: true,
         message: 'Commission withdrawal initiated successfully',
         commissionEarned: currentCommission - amount,
-        reversalRequestID: reversalRes.data.ResponseCode,
-        transactionID: payload.TransactionID
+        b2cRequestID: b2cRes.data.ResponseCode,
+        conversationID: b2cRes.data.ConversationID,
+        originatorConversationID: b2cRes.data.OriginatorConversationID
       };
     });
 
