@@ -2200,6 +2200,16 @@ app.post('/c2b-confirmation', async (req, res) => {
                         logger.info(`🎉 Set hasMadeFirstTopUp to true for user ${userDoc.id} (${userCollection})`);
                     }
                     
+                    // Get the appropriate name field based on user collection
+                    let displayName = 'unknown';
+                    if (userCollection === 'drivers') {
+                        displayName = userData.username || 'unknown';
+                    } else if (userCollection === 'retailers') {
+                        displayName = userData.shopName || 'unknown';
+                    } else if (userCollection === 'organisations') {
+                        displayName = userData.organizationName || userData.orgName || 'unknown';
+                    }
+                    
                     walletUpdateResult = {
                         userId: userDoc.id,
                         userCollection: userCollection,
@@ -2207,7 +2217,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                         incrementedBy: totalToAdd,
                         bonusApplied,
                         bonusPercentage,
-                        organizationName: userData.organizationName || userData.orgName || 'unknown'
+                        organizationName: displayName
                     };
                     logger.info(`✅ Updated walletBalance for user ${userDoc.id} (${userCollection}, accountNumber: ${BillRefNumber}) by Ksh ${totalToAdd} (bonus: ${bonusApplied})`);
                 }
@@ -2794,106 +2804,9 @@ app.post('/api/driver-wallet/topup', async (req, res) => {
   }
 });
 
-// 4. Withdraw from Wallet (STK Push to driver)
-app.post('/api/driver-wallet/withdraw', async (req, res) => {
-  const { driverId, amount, phoneNumber } = req.body;
+// 4. Get Driver Commission
 
-  if (!driverId || !amount || !phoneNumber) {
-    return res.status(400).json({ 
-      success: false, 
-      message: 'Missing required fields' 
-    });
-  }
-
-  try {
-    // Verify driver exists and has sufficient balance
-    const driverRef = firestore.collection('drivers').doc(driverId);
-    
-    await firestore.runTransaction(async (tx) => {
-      const driverDoc = await tx.get(driverRef);
-      if (!driverDoc.exists) {
-        throw new Error('Driver not found');
-      }
-
-      const driverData = driverDoc.data();
-      const currentBalance = driverData.walletBalance || 0;
-      
-      if (currentBalance < amount) {
-        throw new Error('Insufficient wallet balance');
-      }
-
-      // Deduct from wallet
-      tx.update(driverRef, {
-        walletBalance: FieldValue.increment(-amount),
-        lastWalletUpdate: FieldValue.serverTimestamp()
-      });
-
-      // Initiate STK Push to driver's phone number
-      const timestamp = generateTimestamp();
-      const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
-      const token = await getAccessToken();
-
-      const payload = {
-        BusinessShortCode: SHORTCODE,
-        Password: password,
-        Timestamp: timestamp,
-        TransactionType: 'CustomerPayBillOnline',
-        Amount: Number(amount),
-        PartyA: phoneNumber,
-        PartyB: SHORTCODE,
-        PhoneNumber: phoneNumber,
-        CallBackURL: STK_CALLBACK_URL,
-        AccountReference: `WITHDRAW_${driverId}`,
-        TransactionDesc: 'Driver Wallet Withdrawal'
-      };
-
-      const stkRes = await axios.post(
-        'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
-        payload,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
-
-      // Log transaction in driver_transactions collection
-      await firestore.collection('driver_transactions').add({
-        driverId,
-        type: 'WALLET_WITHDRAWAL',
-        amount: -amount,
-        phoneNumber,
-        status: 'PENDING',
-        merchantRequestID: stkRes.data.MerchantRequestID,
-        checkoutRequestID: stkRes.data.CheckoutRequestID,
-        createdAt: FieldValue.serverTimestamp()
-      });
-
-      return {
-        success: true,
-        message: 'Withdrawal initiated',
-        walletBalance: currentBalance - amount,
-        merchantRequestID: stkRes.data.MerchantRequestID,
-        checkoutRequestID: stkRes.data.CheckoutRequestID
-      };
-    });
-
-    res.json({
-      success: true,
-      message: 'Withdrawal initiated successfully',
-      walletBalance: (await driverRef.get()).data().walletBalance
-    });
-  } catch (error) {
-    logger.error('Driver wallet withdrawal error:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: error.message || 'Failed to initiate withdrawal' 
-    });
-  }
-});
-
-// 5. Get Driver Commission
+// 4. Get Driver Commission
 app.get('/api/driver-commission/:driverId', async (req, res) => {
   const { driverId } = req.params;
 
@@ -2922,7 +2835,7 @@ app.get('/api/driver-commission/:driverId', async (req, res) => {
   }
 });
 
-// 6. Withdraw Commission (STK Push to driver)
+// 5. Withdraw Commission (STK Push to driver)
 app.post('/api/driver-commission/withdraw', async (req, res) => {
   const { driverId, amount, phoneNumber } = req.body;
 
@@ -3025,7 +2938,7 @@ app.post('/api/driver-commission/withdraw', async (req, res) => {
   }
 });
 
-// 7. Commission to Wallet
+// 6. Commission to Wallet
 app.post('/api/driver-commission/topup-wallet', async (req, res) => {
   const { driverId, amount } = req.body;
 
@@ -3088,7 +3001,7 @@ app.post('/api/driver-commission/topup-wallet', async (req, res) => {
   }
 });
 
-// 8. Sell Airtime (Wallet or Customer)
+// 7. Sell Airtime (Wallet or Customer)
 app.post('/api/driver-airtime/sell', async (req, res) => {
   const { driverId, amount, recipientPhone, paymentMethod, customerPhone } = req.body;
 
@@ -3320,7 +3233,7 @@ app.get('/api/driver-commission-check', async (req, res) => {
   }
 });
 
-// 9. Get Driver Transactions
+// 8. Get Driver Transactions
 app.get('/api/driver-transactions/:driverId', async (req, res) => {
   const { driverId } = req.params;
 
@@ -3367,7 +3280,7 @@ app.get('/api/driver-transactions/:driverId', async (req, res) => {
   }
 });
 
-// 10. Get Driver Profile
+// 9. Get Driver Profile
 app.get('/api/driver-profile/:driverId', async (req, res) => {
   const { driverId } = req.params;
 
@@ -3402,7 +3315,7 @@ app.get('/api/driver-profile/:driverId', async (req, res) => {
   }
 });
 
-// 11. Update Driver Profile
+// 10. Update Driver Profile
 app.put('/api/driver-profile/:driverId', async (req, res) => {
   const { driverId } = req.params;
   const { username, contactPerson, phoneNumber, idNumber } = req.body;
