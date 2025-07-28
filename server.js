@@ -2858,8 +2858,8 @@ app.post('/api/driver-wallet/withdraw', async (req, res) => {
         }
       );
 
-      // Log transaction
-      await firestore.collection('transactions').add({
+      // Log transaction in driver_transactions collection
+      await firestore.collection('driver_transactions').add({
         driverId,
         type: 'WALLET_WITHDRAWAL',
         amount: -amount,
@@ -2988,8 +2988,8 @@ app.post('/api/driver-commission/withdraw', async (req, res) => {
 
       logger.info(`✅ B2C commission withdrawal initiated - response: ${JSON.stringify(b2cRes.data)}`);
 
-      // Log transaction
-      await firestore.collection('transactions').add({
+      // Log transaction in driver_transactions collection
+      await firestore.collection('driver_transactions').add({
         driverId,
         type: 'COMMISSION_WITHDRAWAL',
         amount: -amount,
@@ -3060,8 +3060,8 @@ app.post('/api/driver-commission/topup-wallet', async (req, res) => {
         lastWalletUpdate: FieldValue.serverTimestamp()
       });
 
-      // Log transaction
-      await firestore.collection('transactions').add({
+      // Log transaction in driver_transactions collection
+      await firestore.collection('driver_transactions').add({
         driverId,
         type: 'COMMISSION_TO_WALLET',
         amount: amount,
@@ -3334,8 +3334,8 @@ app.get('/api/driver-transactions/:driverId', async (req, res) => {
       });
     }
 
-    // Get driver's transactions
-    const transactionsSnapshot = await firestore.collection('transactions')
+    // Get driver's transactions from driver_transactions collection
+    const transactionsSnapshot = await firestore.collection('driver_transactions')
       .where('driverId', '==', driverId)
       .orderBy('createdAt', 'desc')
       .limit(50)
