@@ -2059,8 +2059,8 @@ app.post('/c2b-confirmation', async (req, res) => {
                     // SCENARIO 2: Driver Username - Send airtime and award commission
                     logger.info(`🚗 Driver airtime sale detected - username: ${driverUsername}, driverId: ${driverId}, amount: ${amount}`);
                     
-                    // Find the pending transaction to get recipient phone
-                    const pendingTransactionSnap = await firestore.collection('transactions')
+                    // Find the pending transaction to get recipient phone from single_sales collection
+                    const pendingTransactionSnap = await firestore.collection('single_sales').doc(driverUsername).collection('sales')
                         .where('driverUsername', '==', driverUsername)
                         .where('type', '==', 'DRIVER_AIRTIME_SALE_PENDING')
                         .where('status', '==', 'PENDING')
@@ -2146,21 +2146,7 @@ app.post('/c2b-confirmation', async (req, res) => {
                             });
                         }
                         
-                        // Also log in transactions collection for tracking
-                        await firestore.collection('transactions').add({
-                            driverId,
-                            type: 'DRIVER_AIRTIME_SALE_C2B',
-                            amount: amount,
-                            recipientPhone,
-                            customerPhone: mpesaNumber,
-                            carrier,
-                            commissionEarned: commissionAmount,
-                            status: 'SUCCESS',
-                            transactionId,
-                            saleId,
-                            createdAt: now
-                        });
-                        
+                        // Driver sales are now stored only in single_sales collection
                         logger.info(`✅ Driver airtime sale completed - airtime sent to ${recipientPhone}, commission awarded: ${commissionAmount}`);
                     } else {
                         logger.error(`❌ Failed to send airtime for driver ${driverId}: ${airtimeResult?.message || 'Unknown error'}`);
@@ -3220,8 +3206,9 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
       logger.info(`📱 Airtime send result - driverId: ${driverId}, status: ${airtimeResult.status}, message: ${airtimeResult.message}`);
 
       if (airtimeResult.status === 'SUCCESS') {
-        // Log successful transaction
-        await firestore.collection('transactions').add({
+        // Log successful transaction in single_sales collection
+        const saleId = `DRIVER_SALE_${Date.now()}_${driverId}`;
+        await firestore.collection('single_sales').doc(driverData.username).collection('sales').doc(saleId).set({
           driverId,
           type: 'DRIVER_AIRTIME_SALE',
           amount: amount,
@@ -3230,6 +3217,7 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
           commissionEarned: 0, // No commission for wallet sales
           status: 'SUCCESS',
           transactionId,
+          paymentMethod: 'wallet',
           createdAt: FieldValue.serverTimestamp()
         });
 
@@ -3290,8 +3278,9 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
         }
       );
 
-      // Log pending transaction with recipient phone for C2B retrieval
-      await firestore.collection('transactions').add({
+      // Log pending transaction with recipient phone for C2B retrieval in single_sales collection
+      const saleId = `DRIVER_SALE_${Date.now()}_${driverId}`;
+      await firestore.collection('single_sales').doc(driverData.username).collection('sales').doc(saleId).set({
         driverId,
         type: 'DRIVER_AIRTIME_SALE_PENDING',
         amount: amount,
@@ -3302,6 +3291,7 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
         merchantRequestID: stkRes.data.MerchantRequestID,
         checkoutRequestID: stkRes.data.CheckoutRequestID,
         driverUsername: driverData.username,
+        paymentMethod: 'customer',
         createdAt: FieldValue.serverTimestamp()
       });
 
