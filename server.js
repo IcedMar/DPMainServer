@@ -2835,106 +2835,249 @@ app.get('/api/driver-commission/:driverId', async (req, res) => {
   }
 });
 
-// 5. Withdraw Commission (STK Push to driver)
+// 5. Withdraw Commission (B2C to driver)
 app.post('/api/driver-commission/withdraw', async (req, res) => {
   const { driverId, amount, phoneNumber } = req.body;
 
-  if (!driverId || !amount || !phoneNumber) {
+  logger.info(`[WITHDRAWAL REQUEST] Received request for driverId: ${driverId}, phone: ${phoneNumber}, amount: ${amount}`);
+
+  if (!driverId || !phoneNumber || typeof amount !== 'number' || amount <= 0) {
+    logger.warn(`[WITHDRAWAL ERROR] Bad request - missing or invalid fields. driverId: ${driverId}, phone: ${phoneNumber}, amount: ${amount}`);
     return res.status(400).json({ 
       success: false, 
-      message: 'Missing required fields' 
+      message: 'Missing or invalid fields: driverId, phone, and a positive amount are required.' 
     });
   }
 
+  // Normalize phone number
+  const normalizePhoneNumber = (phone) => {
+    const cleaned = phone.replace(/\D/g, '');
+    if (cleaned.startsWith('254') && cleaned.length === 12) return `+${cleaned}`;
+    if (cleaned.startsWith('0') && cleaned.length === 10) return `+254${cleaned.slice(1)}`;
+    if (cleaned.startsWith('7') && cleaned.length === 9) return `+254${cleaned}`;
+    logger.warn(`[PHONE NORMALIZATION] Invalid phone number format: ${phone}`);
+    return null;
+  };
+
+  const normalizedPhone = normalizePhoneNumber(phoneNumber);
+  if (!normalizedPhone) {
+    logger.warn(`[WITHDRAWAL ERROR] Invalid phone number format provided: ${phoneNumber}`);
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Invalid phone number format. Please use a valid Kenyan Safaricom number.' 
+    });
+  }
+
+  // Throttle to prevent duplicate requests
+  const throttleKey = `${driverId}:${normalizedPhone}`;
+  const THROTTLE_TIMEOUT_MS = 180_000; // 3 minutes
+  const activeWithdrawals = new Map();
+
+  if (activeWithdrawals.has(throttleKey)) {
+    logger.warn(`[WITHDRAWAL THROTTLE] Duplicate request detected for ${throttleKey}.`);
+    return res.status(429).json({ 
+      success: false, 
+      message: 'A withdrawal request for this driver and phone number is already being processed. Please try again shortly.' 
+    });
+  }
+
+  // Acknowledge the request early to prevent client timeouts while processing
+  res.status(200).json({ 
+    success: true, 
+    message: 'Withdrawal request received and processing initiated.' 
+  });
+  logger.info(`[WITHDRAWAL ACK] Acknowledged request for ${driverId}. Proceeding with background processing.`);
+
   try {
+    activeWithdrawals.set(throttleKey, true);
+    setTimeout(() => {
+      activeWithdrawals.delete(throttleKey);
+      logger.info(`[WITHDRAWAL THROTTLE] Throttle for ${throttleKey} expired and removed.`);
+    }, THROTTLE_TIMEOUT_MS);
+
     // Verify driver exists and has sufficient commission
     const driverRef = firestore.collection('drivers').doc(driverId);
+    const driverDoc = await driverRef.get();
     
-    await firestore.runTransaction(async (tx) => {
-      const driverDoc = await tx.get(driverRef);
-      if (!driverDoc.exists) {
-        throw new Error('Driver not found');
+    if (!driverDoc.exists) {
+      logger.warn(`[WITHDRAWAL ERROR] Driver not found: ${driverId}. Aborting withdrawal.`);
+      activeWithdrawals.delete(throttleKey);
+      return;
+    }
+
+    const driverData = driverDoc.data();
+    const availableCommission = driverData.commissionEarned || 0;
+    
+    if (availableCommission < amount) {
+      logger.warn(`[WITHDRAWAL ERROR] Insufficient commission for driver ${driverId}. Available: ${availableCommission}, Requested: ${amount}.`);
+      activeWithdrawals.delete(throttleKey);
+      return;
+    }
+
+    // Get M-Pesa access token
+    const getAccessToken = async () => {
+      const consumerKey = process.env.WITHDRAWAL_CONSUMER_KEY;
+      const consumerSecret = process.env.WITHDRAWAL_CONSUMER_SECRET;
+
+      if (!consumerKey || !consumerSecret) {
+        logger.error('[MPESA AUTH] WITHDRAWAL_CONSUMER_KEY or WITHDRAWAL_CONSUMER_SECRET not set in .env');
+        throw new Error('M-Pesa API credentials are not configured.');
       }
 
-      const driverData = driverDoc.data();
-      const currentCommission = driverData.commissionEarned || 0;
-      
-      if (currentCommission < amount) {
-        throw new Error('Insufficient commission balance');
-      }
+      const auth = Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
 
-      // Deduct commission
-      tx.update(driverRef, {
-        commissionEarned: FieldValue.increment(-amount)
-      });
+      try {
+        const response = await axios.get('https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
+          headers: { Authorization: `Basic ${auth}` }
+        });
 
-      // Initiate B2C (Business to Customer) payment to driver's phone number
-      const timestamp = generateTimestamp();
-      const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
-      const token = await getAccessToken();
-
-      const payload = {
-        InitiatorName: 'DaimaPay',
-        SecurityCredential: generateSecurityCredential(PASSKEY),
-        CommandID: 'BusinessPayment',
-        Amount: Number(amount),
-        PartyA: SHORTCODE, // Business shortcode
-        PartyB: phoneNumber, // Driver's phone number
-        Remarks: `Commission withdrawal for driver ${driverId}`,
-        QueueTimeOutURL: `${BASE_URL}/api/mpesa/timeout`,
-        ResultURL: `${BASE_URL}/api/mpesa/result`,
-        Occasion: 'Commission Withdrawal'
-      };
-
-      logger.info(`💰 Initiating B2C commission withdrawal - driverId: ${driverId}, amount: ${amount}, phoneNumber: ${phoneNumber}`);
-
-      const b2cRes = await axios.post(
-        'https://api.safaricom.co.ke/mpesa/b2c/v1/paymentrequest',
-        payload,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json'
-          }
+        if (!response.data.access_token) {
+          throw new Error('Access token not found in M-Pesa authentication response.');
         }
-      );
+        
+        logger.info('[MPESA AUTH] Successfully retrieved M-Pesa access token.');
+        return response.data.access_token;
+      } catch (err) {
+        logger.error(`[MPESA AUTH FATAL] Error during access token retrieval: ${err.message}`);
+        throw err;
+      }
+    };
 
-      logger.info(`✅ B2C commission withdrawal initiated - response: ${JSON.stringify(b2cRes.data)}`);
+    // Encrypt password using certificate
+    const encryptPassword = async (password) => {
+      try {
+        const certPath = process.env.WITHDRAWAL_MPESA_CERT_PATH;
+        if (!certPath) {
+          logger.error('[CERT ENCRYPTION] WITHDRAWAL_MPESA_CERT_PATH is not set in .env');
+          throw new Error('WITHDRAWAL_MPESA_CERT_PATH is not set in environment variables.');
+        }
 
-      // Log transaction in driver_transactions collection
-      await firestore.collection('driver_transactions').add({
-        driverId,
-        type: 'COMMISSION_WITHDRAWAL',
-        amount: -amount,
-        phoneNumber,
-        status: 'PENDING',
-        b2cRequestID: b2cRes.data.ResponseCode,
-        conversationID: b2cRes.data.ConversationID,
-        originatorConversationID: b2cRes.data.OriginatorConversationID,
-        createdAt: FieldValue.serverTimestamp()
+        const fs = require('fs');
+        const forge = require('node-forge');
+        const path = require('path');
+
+        const absolutePath = path.resolve(certPath);
+        const certBuffer = fs.readFileSync(absolutePath, 'utf8');
+
+        const cert = forge.pki.certificateFromPem(certBuffer);
+        if (!cert || !cert.publicKey) {
+          throw new Error('Invalid M-Pesa certificate or missing public key.');
+        }
+
+        const encrypted = cert.publicKey.encrypt(password, 'RSAES-PKCS1-V1_5');
+        logger.info('[CERT ENCRYPTION] Password encrypted successfully.');
+        return Buffer.from(encrypted).toString('base64');
+      } catch (err) {
+        logger.error(`[CERT ENCRYPTION FATAL] Error during password encryption: ${err.message}`);
+        throw err;
+      }
+    };
+
+    const token = await getAccessToken();
+    const mpesaInitiatorPassword = process.env.WITHDRAWAL_INITIATOR_PASSWORD;
+    if (!mpesaInitiatorPassword) {
+      logger.error('[WITHDRAWAL ERROR] WITHDRAWAL_INITIATOR_PASSWORD is not set in .env.');
+      activeWithdrawals.delete(throttleKey);
+      return;
+    }
+    
+    const password = await encryptPassword(mpesaInitiatorPassword);
+    const { v4: uuidv4 } = require('uuid');
+    const transactionId = uuidv4();
+
+    const shortcode = process.env.WITHDRAWAL_SHORTCODE;
+    const initiatorName = process.env.WITHDRAWAL_INITIATOR_NAME;
+    const baseUrl = process.env.WITHDRAWAL_BASE_URL;
+
+    if (!shortcode || !initiatorName || !baseUrl) {
+      logger.error('[WITHDRAWAL ERROR] Missing M-Pesa configuration in .env (WITHDRAWAL_SHORTCODE, WITHDRAWAL_INITIATOR_NAME, WITHDRAWAL_BASE_URL).');
+      activeWithdrawals.delete(throttleKey);
+      return;
+    }
+
+    const payload = {
+      OriginatorConversationID: transactionId,
+      InitiatorName: initiatorName,
+      SecurityCredential: password,
+      CommandID: 'BusinessPayment', // B2C transaction
+      Amount: amount,
+      PartyA: shortcode,
+      PartyB: normalizedPhone.replace('+', ''), // M-Pesa expects phone without '+'
+      Remarks: 'Commission Withdrawal',
+      QueueTimeOutURL: `${baseUrl}/withdraw/timeout?driverId=${driverId}&transactionId=${transactionId}`,
+      ResultURL: `${baseUrl}/withdraw/result?driverId=${driverId}&transactionId=${transactionId}`,
+      Occasion: 'Commission withdrawal',
+    };
+
+    // Store transaction in driver_transactions collection
+    await firestore.collection('driver_transactions').add({
+      driverId,
+      type: 'COMMISSION_WITHDRAWAL',
+      amount: -amount,
+      phoneNumber: normalizedPhone,
+      status: 'PENDING',
+      transactionId: transactionId,
+      mpesa_request_payload: payload,
+      createdAt: FieldValue.serverTimestamp()
+    });
+    logger.info(`[WITHDRAWAL DB] Transaction ${transactionId} created in driver_transactions as pending.`);
+
+    logger.info(`[WITHDRAWAL INIT] Initiating M-Pesa B2C for driver ${driverId} (${normalizedPhone}) for KES ${amount}. Transaction ID: ${transactionId}`);
+
+    const mpesaResponse = await axios.post(
+      'https://api.safaricom.co.ke/mpesa/b2c/v1/paymentrequest',
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        }
+      }
+    );
+
+    const mpesaResponseData = mpesaResponse.data;
+
+    if (!mpesaResponse.ok) {
+      logger.error(`[MPESA API ERROR] M-Pesa B2C API call failed for transaction ${transactionId}: ${mpesaResponse.status} - ${JSON.stringify(mpesaResponseData)}`);
+
+      // Update transaction status in driver_transactions collection
+      const transactionQuery = await firestore.collection('driver_transactions')
+        .where('transactionId', '==', transactionId)
+        .limit(1)
+        .get();
+      
+      if (!transactionQuery.empty) {
+        const transactionDoc = transactionQuery.docs[0];
+        await transactionDoc.ref.update({
+          status: 'FAILED_API_ERROR',
+          completed_at: FieldValue.serverTimestamp(),
+          mpesa_response_error: mpesaResponseData,
+        });
+      }
+      
+      activeWithdrawals.delete(throttleKey);
+      return;
+    }
+
+    logger.info(`[MPESA API SUCCESS] M-Pesa B2C API call successful for transaction ${transactionId}. Response: ${JSON.stringify(mpesaResponseData)}`);
+
+    // Update transaction with M-Pesa response data
+    const transactionQuery = await firestore.collection('driver_transactions')
+      .where('transactionId', '==', transactionId)
+      .limit(1)
+      .get();
+    
+    if (!transactionQuery.empty) {
+      const transactionDoc = transactionQuery.docs[0];
+      await transactionDoc.ref.update({
+        mpesa_response: mpesaResponseData,
+        lastUpdated: FieldValue.serverTimestamp()
       });
+    }
 
-      return {
-        success: true,
-        message: 'Commission withdrawal initiated successfully',
-        commissionEarned: currentCommission - amount,
-        b2cRequestID: b2cRes.data.ResponseCode,
-        conversationID: b2cRes.data.ConversationID,
-        originatorConversationID: b2cRes.data.OriginatorConversationID
-      };
-    });
-
-    res.json({
-      success: true,
-      message: 'Commission withdrawal initiated successfully',
-      commissionEarned: (await driverRef.get()).data().commissionEarned
-    });
-  } catch (error) {
-    logger.error('Driver commission withdrawal error:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: error.message || 'Failed to initiate commission withdrawal' 
-    });
+  } catch (err) {
+    logger.error(`[WITHDRAWAL FATAL] Uncaught error during withdrawal initiation for driver ${driverId}: ${err.message}`, err.stack);
+    activeWithdrawals.delete(throttleKey);
   }
 });
 
