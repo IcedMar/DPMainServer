@@ -3220,24 +3220,6 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
       logger.info(`📱 Airtime send result - driverId: ${driverId}, status: ${airtimeResult.status}, message: ${airtimeResult.message}`);
 
       if (airtimeResult.status === 'SUCCESS') {
-        // Award commission
-        const commissionDoc = await firestore.collection('wallet_bonuses').doc('drivers_comm').get();
-        const commissionPercentage = commissionDoc.exists ? commissionDoc.data().percentage || 0 : 0;
-        const commissionAmount = amount * (commissionPercentage / 100);
-
-        logger.info(`📊 Commission document check - exists: ${commissionDoc.exists}, percentage: ${commissionPercentage}%, document data: ${JSON.stringify(commissionDoc.exists ? commissionDoc.data() : 'N/A')}`);
-
-        logger.info(`💰 Driver commission calculation - driverId: ${driverId}, amount: ${amount}, commissionPercentage: ${commissionPercentage}%, commissionAmount: ${commissionAmount}`);
-
-        if (commissionAmount > 0) {
-          await driverRef.update({
-            commissionEarned: FieldValue.increment(commissionAmount)
-          });
-          logger.info(`✅ Commission awarded to driver ${driverId}: ${commissionAmount}`);
-        } else {
-          logger.warn(`⚠️ No commission awarded - percentage is 0 or document not found for driver ${driverId}`);
-        }
-
         // Log successful transaction
         await firestore.collection('transactions').add({
           driverId,
@@ -3245,7 +3227,7 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
           amount: amount,
           recipientPhone,
           carrier,
-          commissionEarned: commissionAmount,
+          commissionEarned: 0, // No commission for wallet sales
           status: 'SUCCESS',
           transactionId,
           createdAt: FieldValue.serverTimestamp()
@@ -3255,8 +3237,8 @@ app.post('/api/driver-airtime/sell', async (req, res) => {
           success: true,
           message: 'Airtime sent successfully',
           transactionId,
-          commissionEarned: commissionAmount,
-          commissionPercentage: commissionPercentage
+          commissionEarned: 0, // No commission for wallet sales
+          commissionPercentage: 0
         });
       } else {
         // Refund wallet if airtime failed
@@ -4134,37 +4116,7 @@ app.post('/api/single-airtime', async (req, res) => {
 
   // Handle commission for drivers on successful airtime sends
   if (status === 'SUCCESS' && detectedUserType === 'driver') {
-    try {
-      // Award commission to driver
-      const commissionDoc = await firestore.collection('wallet_bonuses').doc('drivers_comm').get();
-      const commissionPercentage = commissionDoc.exists ? commissionDoc.data().percentage || 0 : 0;
-      const commissionAmount = amount * (commissionPercentage / 100);
-      
-      logger.info(`💰 Driver commission calculation - driverId: ${userId}, amount: ${amount}, commissionPercentage: ${commissionPercentage}%, commissionAmount: ${commissionAmount}`);
-      
-      if (commissionAmount > 0) {
-        await userRef.update({
-          commissionEarned: FieldValue.increment(commissionAmount),
-          lastCommissionUpdate: FieldValue.serverTimestamp()
-        });
-        logger.info(`✅ Commission awarded to driver ${userId}: ${commissionAmount} KES`);
-        
-        // Log commission award
-        await firestore.collection('bonus_history').add({
-          type: 'DRIVER_COMMISSION_AWARDED',
-          driverId: userId,
-          driverUsername: userData.username || 'unknown',
-          transactionId: `SINGLE_AIRTIME_${Date.now()}`,
-          saleId: `SINGLE_SALE_${Date.now()}`,
-          originalAmount: amount,
-          commissionPercentage: commissionPercentage,
-          commissionAmount: commissionAmount,
-          createdAt: FieldValue.serverTimestamp()
-        });
-      }
-    } catch (err) {
-      logger.error('❌ Failed to award commission to driver:', err);
-    }
+    logger.info(`✅ Driver single airtime sale completed - no commission awarded for wallet sales`);
   }
 
   // Create single sale record for successful airtime sends
