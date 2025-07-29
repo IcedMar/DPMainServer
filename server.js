@@ -133,6 +133,7 @@ app.use(bodyParser.json({ limit: '1mb' }));
 // Allow specific origins (recommended for production)
 const allowedOrigins = [
     'https://www.daimapay.com',
+    'https://daimapay.com',
     'https://daimapay-51406.web.app',
     'https://daimapay.web.app',
     'https://daimapay-wallet.web.app',
