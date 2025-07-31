@@ -1305,10 +1305,18 @@ app.post('/stk-callback', async (req, res) => {
     const commonStkUpdateData = {
         mpesaResultCode: ResultCode,
         mpesaResultDesc: ResultDesc,
-        mpesaCallbackMetadata: CallbackMetadata, // Store full metadata
-        customerPhoneNumber: customerPhoneNumber, // From M-Pesa callback (PartyA)
         lastUpdated: FieldValue.serverTimestamp(),
     };
+    
+    // Only add CallbackMetadata if it exists (it might be undefined for failed/cancelled payments)
+    if (CallbackMetadata) {
+        commonStkUpdateData.mpesaCallbackMetadata = CallbackMetadata;
+    }
+    
+    // Only add customerPhoneNumber if it exists
+    if (customerPhoneNumber) {
+        commonStkUpdateData.customerPhoneNumber = customerPhoneNumber;
+    }
 
     // Check M-Pesa ResultCode for success
     if (ResultCode === 0) {
