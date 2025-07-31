@@ -89,6 +89,9 @@ function hashString(str) {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Trust proxy for rate limiting to work correctly with load balancers
+app.set('trust proxy', 1);
+
 // --- Firestore Initialization ---
 const firestore = new Firestore({
     projectId: process.env.GCP_PROJECT_ID,
@@ -130,6 +133,27 @@ const BASE_URL = process.env.CALLBACK_URL?.replace('/stk-callback', '') || 'http
 // --- Middleware ---
 app.use(helmet());
 app.use(bodyParser.json({ limit: '1mb' }));
+
+// Special middleware for STK callback to handle different body formats
+app.use('/stk-callback', (req, res, next) => {
+    // If body is already parsed as object, continue
+    if (typeof req.body === 'object' && req.body !== null) {
+        return next();
+    }
+    
+    // If body is a string, try to parse it
+    if (typeof req.body === 'string') {
+        try {
+            req.body = JSON.parse(req.body);
+            logger.info('📞 Successfully parsed stringified STK callback body');
+        } catch (error) {
+            logger.error('❌ Failed to parse STK callback string body:', error.message);
+            logger.error('❌ Raw body string:', req.body);
+        }
+    }
+    
+    next();
+});
 // Allow specific origins (recommended for production)
 const allowedOrigins = [
     'https://www.daimapay.com',
@@ -1218,6 +1242,7 @@ app.post('/stk-push', stkPushLimiter, async (req, res) => {
 // Modified STK Callback Endpoint
 app.post('/stk-callback', async (req, res) => {
     const callback = req.body;
+    
     logger.info('📞 Received STK Callback:', JSON.stringify(callback, null, 2)); // Log full callback for debugging
 
     // Safaricom sends an empty object on initial push confirmation before payment
@@ -1242,6 +1267,29 @@ app.post('/stk-callback', async (req, res) => {
 
     if (!stkTransactionDoc.exists) {
         logger.error(`❌ No matching STK transaction record for CheckoutRequestID (${CheckoutRequestID}) found in 'stk_transactions' collection.`);
+        
+        // Log additional debugging information
+        logger.error(`🔍 Debugging STK callback issue:`, {
+            checkoutRequestID: CheckoutRequestID,
+            merchantRequestID: MerchantRequestID,
+            callbackData: callback,
+            timestamp: new Date().toISOString()
+        });
+        
+        // Check if there are any recent STK transactions with similar IDs
+        const recentTransactions = await stkTransactionsCollection
+            .where('checkoutRequestID', '>=', CheckoutRequestID.substring(0, 10))
+            .where('checkoutRequestID', '<=', CheckoutRequestID.substring(0, 10) + '\uf8ff')
+            .limit(5)
+            .get();
+            
+        if (!recentTransactions.empty) {
+            logger.warn(`⚠️ Found ${recentTransactions.size} recent STK transactions with similar IDs:`, 
+                recentTransactions.docs.map(doc => doc.data().checkoutRequestID));
+        } else {
+            logger.warn(`⚠️ No recent STK transactions found with similar IDs`);
+        }
+        
         // Respond with success to M-Pesa to prevent retries of this unknown callback,
         // but log for manual investigation.
         return res.json({ ResultCode: 0, ResultDesc: 'No matching STK transaction record found.' });
@@ -2112,7 +2160,17 @@ app.post('/c2b-confirmation', async (req, res) => {
                         
                         // Log successful airtime sale in single_sales collection
                         const saleId = `SINGLE_SALE_${Date.now()}_${driverId}`;
-                        const organizationName = userData.username || 'unknown';
+                        const organizationName = userData.username || userData.displayName || userData.name || userData.shopName || userData.organizationName || userData.orgName || userData.email || userData.phoneNumber || driverId || 'unknown';
+                        
+                        // Log the user data for debugging if organizationName is still 'unknown'
+                        if (organizationName === 'unknown') {
+                            logger.warn(`⚠️ Could not find organization name for driver ${driverId}. User data:`, {
+                                userData: userData,
+                                availableFields: Object.keys(userData || {})
+                            });
+                        } else {
+                            logger.info(`✅ Found organization name for driver ${driverId}: ${organizationName}`);
+                        }
                         
                         try {
                             await firestore.collection('single_sales').doc(organizationName).collection('sales').doc(saleId).set({
@@ -2190,11 +2248,21 @@ app.post('/c2b-confirmation', async (req, res) => {
                     // Get the appropriate name field based on user collection
                     let displayName = 'unknown';
                     if (userCollection === 'drivers') {
-                        displayName = userData.username || 'unknown';
+                        displayName = userData.username || userData.displayName || userData.name || userData.shopName || userData.organizationName || userData.orgName || userData.email || userData.phoneNumber || userDoc.id || 'unknown';
                     } else if (userCollection === 'retailers') {
-                        displayName = userData.shopName || 'unknown';
+                        displayName = userData.shopName || userData.displayName || userData.name || userData.username || userData.organizationName || userData.orgName || userData.email || userData.phoneNumber || userDoc.id || 'unknown';
                     } else if (userCollection === 'organisations') {
-                        displayName = userData.organizationName || userData.orgName || 'unknown';
+                        displayName = userData.organizationName || userData.orgName || userData.displayName || userData.name || userData.username || userData.shopName || userData.email || userData.phoneNumber || userDoc.id || 'unknown';
+                    }
+                    
+                    // Log the user data for debugging if displayName is still 'unknown'
+                    if (displayName === 'unknown') {
+                        logger.warn(`⚠️ Could not find display name for user ${userDoc.id} in collection ${userCollection}. User data:`, {
+                            userData: userData,
+                            availableFields: Object.keys(userData || {})
+                        });
+                    } else {
+                        logger.info(`✅ Found display name for user ${userDoc.id}: ${displayName}`);
                     }
                     
                     walletUpdateResult = {
@@ -3907,6 +3975,47 @@ app.post('/api/mpesa/stkpush', async (req, res) => {
       }
     );
     
+    logger.info('STK Push Request Sent to Daraja:', stkRes.data);
+    
+    const {
+      ResponseCode,
+      ResponseDescription,
+      CustomerMessage,
+      CheckoutRequestID,
+      MerchantRequestID
+    } = stkRes.data;
+    
+    // Create stk_transaction record if M-Pesa successfully accepted the push request
+    if (ResponseCode === '0') {
+      await stkTransactionsCollection.doc(CheckoutRequestID).set({
+        checkoutRequestID: CheckoutRequestID,
+        merchantRequestID: MerchantRequestID,
+        phoneNumber: phoneNumber,
+        amount: Number(amount),
+        recipient: accountNumber, // For wallet top-up, recipient is the account number
+        carrier: 'N/A', // Not applicable for wallet top-up
+        initialRequestAt: FieldValue.serverTimestamp(),
+        stkPushStatus: 'PUSH_INITIATED',
+        stkPushPayload: payload,
+        darajaResponse: stkRes.data,
+        customerName: null,
+        serviceType: 'wallet_topup',
+        reference: accountNumber,
+        lastUpdated: FieldValue.serverTimestamp(),
+      });
+      logger.info(`✅ STK Transaction document ${CheckoutRequestID} created for wallet top-up.`);
+    } else {
+      logger.error('❌ STK Push Request Failed by Daraja:', stkRes.data);
+      await errorsCollection.add({
+        type: 'STK_PUSH_INITIATION_FAILED_BY_DARJA',
+        error: ResponseDescription,
+        requestPayload: payload,
+        mpesaResponse: stkRes.data,
+        createdAt: FieldValue.serverTimestamp(),
+        checkoutRequestID: CheckoutRequestID,
+      });
+    }
+    
     res.json({
       message: 'STK Push initiated. Await callback for confirmation.',
       merchantRequestID: stkRes.data.MerchantRequestID,
@@ -3981,6 +4090,49 @@ app.post('/api/driver/stkpush', async (req, res) => {
         }
       }
     );
+    
+    logger.info('Driver STK Push Request Sent to Daraja:', stkRes.data);
+    
+    const {
+      ResponseCode,
+      ResponseDescription,
+      CustomerMessage,
+      CheckoutRequestID,
+      MerchantRequestID
+    } = stkRes.data;
+    
+    // Create stk_transaction record if M-Pesa successfully accepted the push request
+    if (ResponseCode === '0') {
+      await stkTransactionsCollection.doc(CheckoutRequestID).set({
+        checkoutRequestID: CheckoutRequestID,
+        merchantRequestID: MerchantRequestID,
+        phoneNumber: customerPhone,
+        amount: Number(amount),
+        recipient: recipientPhone,
+        carrier: telco,
+        initialRequestAt: FieldValue.serverTimestamp(),
+        stkPushStatus: 'PUSH_INITIATED',
+        stkPushPayload: payload,
+        darajaResponse: stkRes.data,
+        customerName: null,
+        serviceType: 'driver_airtime_sale',
+        reference: driverUsername,
+        driverUsername: driverUsername,
+        lastUpdated: FieldValue.serverTimestamp(),
+      });
+      logger.info(`✅ STK Transaction document ${CheckoutRequestID} created for driver airtime sale.`);
+    } else {
+      logger.error('❌ Driver STK Push Request Failed by Daraja:', stkRes.data);
+      await errorsCollection.add({
+        type: 'STK_PUSH_INITIATION_FAILED_BY_DARJA',
+        error: ResponseDescription,
+        requestPayload: payload,
+        mpesaResponse: stkRes.data,
+        createdAt: FieldValue.serverTimestamp(),
+        checkoutRequestID: CheckoutRequestID,
+        driverUsername: driverUsername,
+      });
+    }
     
     logger.info(`🚗 Driver STK Push initiated - driver: ${driverUsername}, customer: ${customerPhone}, recipient: ${recipientPhone}, amount: ${amount}`);
     
@@ -4158,6 +4310,7 @@ app.post('/api/single-airtime', async (req, res) => {
     userType: detectedUserType
   });
 }); 
+
 // --- ADMIN BULK OPERATIONS ENDPOINTS ---
 
 // --- ADMIN BULK ENDPOINTS (CORPORATE USERS ONLY) ---
@@ -4297,6 +4450,135 @@ app.get('/api/admin/bulk-sales', async (req, res) => {
   } catch (error) {
     console.error('Error fetching bulk sales:', error);
     res.status(500).json({ error: 'Failed to fetch bulk sales' });
+  }
+});
+
+// Get all single sales for admin and users
+app.get('/api/admin/single-sales', async (req, res) => {
+  try {
+    const { page = 1, limit = 20, organizationName, status, startDate, endDate, userType } = req.query;
+    const pageNumber = parseInt(page);
+    const pageSize = parseInt(limit);
+    const offset = (pageNumber - 1) * pageSize;
+
+    let allSales = [];
+    let totalCount = 0;
+
+    if (organizationName) {
+      // Get sales for specific organization/user
+      const salesSnapshot = await firestore.collection('single_sales').doc(organizationName).collection('sales')
+        .orderBy('createdAt', 'desc')
+        .get();
+      
+      allSales = salesSnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        createdAt: doc.data().createdAt?.toDate?.() || doc.data().createdAt,
+        lastUpdated: doc.data().lastUpdated?.toDate?.() || doc.data().lastUpdated
+      }));
+    } else {
+      // Get all sales from all organizations/users
+      const orgsSnapshot = await firestore.collection('single_sales').get();
+      for (const orgDoc of orgsSnapshot.docs) {
+        const salesSnapshot = await orgDoc.ref.collection('sales')
+          .orderBy('createdAt', 'desc')
+          .get();
+        
+        const orgSales = salesSnapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data(),
+          createdAt: doc.data().createdAt?.toDate?.() || doc.data().createdAt,
+          lastUpdated: doc.data().lastUpdated?.toDate?.() || doc.data().lastUpdated
+        }));
+        allSales.push(...orgSales);
+      }
+    }
+
+    // Apply filters
+    if (status) {
+      allSales = allSales.filter(sale => sale.status === status);
+    }
+    if (userType) {
+      allSales = allSales.filter(sale => sale.userType === userType);
+    }
+    if (startDate && endDate) {
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      allSales = allSales.filter(sale => {
+        const saleDate = sale.createdAt instanceof Date ? sale.createdAt : new Date(sale.createdAt);
+        return saleDate >= start && saleDate <= end;
+      });
+    }
+
+    totalCount = allSales.length;
+
+    // Apply pagination
+    const paginatedSales = allSales.slice(offset, offset + pageSize);
+
+    res.json({
+      sales: paginatedSales,
+      pagination: {
+        currentPage: pageNumber,
+        pageSize,
+        totalCount,
+        totalPages: Math.ceil(totalCount / pageSize)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching single sales:', error);
+    res.status(500).json({ error: 'Failed to fetch single sales' });
+  }
+});
+
+// Get single sales for specific user (driver, retailer, organization)
+app.get('/api/user/single-sales/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { page = 1, limit = 20, status, startDate, endDate } = req.query;
+    const pageNumber = parseInt(page);
+    const pageSize = parseInt(limit);
+    const offset = (pageNumber - 1) * pageSize;
+
+    // Get sales for specific user
+    const salesSnapshot = await firestore.collection('single_sales').doc(userId).collection('sales')
+      .orderBy('createdAt', 'desc')
+      .get();
+    
+    let allSales = salesSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+      createdAt: doc.data().createdAt?.toDate?.() || doc.data().createdAt,
+      lastUpdated: doc.data().lastUpdated?.toDate?.() || doc.data().lastUpdated
+    }));
+
+    // Apply filters
+    if (status) {
+      allSales = allSales.filter(sale => sale.status === status);
+    }
+    if (startDate && endDate) {
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      allSales = allSales.filter(sale => {
+        const saleDate = sale.createdAt instanceof Date ? sale.createdAt : new Date(sale.createdAt);
+        return saleDate >= start && saleDate <= end;
+      });
+    }
+
+    const totalCount = allSales.length;
+    const paginatedSales = allSales.slice(offset, offset + pageSize);
+
+    res.json({
+      sales: paginatedSales,
+      pagination: {
+        currentPage: pageNumber,
+        pageSize,
+        totalCount,
+        totalPages: Math.ceil(totalCount / pageSize)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching user single sales:', error);
+    res.status(500).json({ error: 'Failed to fetch user single sales' });
   }
 });
 
