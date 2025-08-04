@@ -4229,164 +4229,206 @@ app.post('/api/driver/stkpush', async (req, res) => {
 
 // --- SINGLE AIRTIME ENDPOINT ---
 app.post('/api/single-airtime', async (req, res) => {
-  const { requests, totalAmount, userId, userType } = req.body;
-  
-  if (!Array.isArray(requests) || requests.length !== 1 || !totalAmount || !userId) {
-    return res.status(400).json({ error: 'Invalid request format. Expected single airtime request.' });
-  }
-
-  const { phoneNumber, amount, telco, name } = requests[0];
-  
-  if (!phoneNumber || !amount || !telco) {
-    return res.status(400).json({ error: 'Missing required fields: phoneNumber, amount, telco.' });
-  }
-
-  // Get user data to extract organization/shop/username and deduct wallet balance
-  let organizationName = 'unknown';
-  let userData = null;
-  let userRef = null;
-  let detectedUserType = null;
-  
-  try {
-    // Check both retailers and drivers collections
-    const [retailersDoc, driversDoc] = await Promise.all([
-      firestore.collection('retailers').doc(userId).get(),
-      firestore.collection('drivers').doc(userId).get()
-    ]);
+    const { requests, totalAmount, userId, userType } = req.body;
     
-    if (retailersDoc.exists) {
-      userData = retailersDoc.data();
-      userRef = retailersDoc.ref;
-      detectedUserType = 'retailer';
-      // Retailers have shopName
-      organizationName = userData.shopName || userData.organizationName || 'unknown';
-    } else if (driversDoc.exists) {
-      userData = driversDoc.data();
-      userRef = driversDoc.ref;
-      detectedUserType = 'driver';
-      // Drivers have username
-      organizationName = userData.username || userData.organizationName || 'unknown';
-    } else {
-      return res.status(400).json({ error: 'Single airtime is only available for drivers and retailers. User not found in either collection.' });
+    if (!Array.isArray(requests) || requests.length !== 1 || !totalAmount || !userId) {
+        return res.status(400).json({ error: 'Invalid request format. Expected single airtime request.' });
     }
+
+    const { phoneNumber, amount, telco, name } = requests[0];
     
-    // Validate userType if provided
-    if (userType && userType !== detectedUserType) {
-      console.warn(`User type mismatch: expected ${userType}, detected ${detectedUserType} for userId: ${userId}`);
+    if (!phoneNumber || !amount || !telco) {
+        return res.status(400).json({ error: 'Missing required fields: phoneNumber, amount, telco.' });
     }
-    
-    // Deduct wallet balance before sending airtime
-    await firestore.runTransaction(async (tx) => {
-      const userDoc = await tx.get(userRef);
-      if (!userDoc.exists) {
-        throw new Error('User not found.');
-      }
-      const currentBalance = userData.walletBalance || 0;
-      if (currentBalance < totalAmount) {
-        throw new Error('Insufficient wallet balance.');
-      }
-      tx.update(userRef, {
-        walletBalance: FieldValue.increment(-totalAmount),
-        lastWalletUpdate: FieldValue.serverTimestamp()
-      });
-    });
-  } catch (err) {
-    console.error('Single airtime wallet deduction error:', err);
-    return res.status(400).json({ error: err.message || 'Failed to deduct wallet balance.' });
-  }
 
-  // Send airtime
-  let status = 'FAILED';
-  let message = '';
-  let dispatchResult = null;
-  
-  try {
-    let result;
-    if (telco && telco.toLowerCase() === 'safaricom') {
-      result = await sendSafaricomAirtime(phoneNumber, amount);
-      if (result && result.status === 'SUCCESS') {
-        status = 'SUCCESS';
-        message = 'Airtime sent via Safaricom';
-      } else {
-        // Fallback to Africa's Talking
-        result = await sendAfricasTalkingAirtime(phoneNumber, amount, telco);
-        if (result && result.status === 'SUCCESS') {
-          status = 'SUCCESS';
-          message = 'Airtime sent via Africa\'s Talking fallback';
-        } else {
-          message = result && result.message ? result.message : 'Both Safaricom and fallback failed';
-        }
-      }
-    } else {
-      // Non-Safaricom: use Africa's Talking
-      result = await sendAfricasTalkingAirtime(phoneNumber, amount, telco);
-      if (result && result.status === 'SUCCESS') {
-        status = 'SUCCESS';
-        message = 'Airtime sent via Africa\'s Talking';
-      } else {
-        message = result && result.message ? result.message : 'Africa\'s Talking failed';
-      }
-    }
-    dispatchResult = result;
-  } catch (err) {
-    message = err.message || 'Exception during airtime dispatch';
-  }
-
-  // Handle commission for drivers on successful airtime sends
-  if (status === 'SUCCESS' && detectedUserType === 'driver') {
-    logger.info(`✅ Driver single airtime sale completed - no commission awarded for wallet sales`);
-  }
-
-  // Create single sale record for successful airtime sends
-  if (status === 'SUCCESS') {
-    const saleId = `SINGLE_SALE_${Date.now()}`;
-    logger.info(`🔄 Attempting to write single sale for ${detectedUserType}: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`);
+    // Get user data to extract organization/shop/username and deduct wallet balance
+    let organizationName = 'unknown';
+    let userData = null;
+    let userRef = null;
+    let detectedUserType = null;
     
     try {
-      await singleSalesCollection.doc(organizationName).collection('sales').doc(saleId).set({
-        saleId,
-        type: 'SINGLE_AIRTIME_SALE',
-        userId,
-        userType: detectedUserType,
-        organizationName,
+        // Check both retailers and drivers collections
+        const [retailersDoc, driversDoc] = await Promise.all([
+            firestore.collection('retailers').doc(userId).get(),
+            firestore.collection('drivers').doc(userId).get()
+        ]);
+        
+        if (retailersDoc.exists) {
+            userData = retailersDoc.data();
+            userRef = retailersDoc.ref;
+            detectedUserType = 'retailer';
+            // Retailers have shopName
+            organizationName = userData.shopName || userData.organizationName || 'unknown';
+        } else if (driversDoc.exists) {
+            userData = driversDoc.data();
+            userRef = driversDoc.ref;
+            detectedUserType = 'driver';
+            // Drivers have username
+            organizationName = userData.username || userData.organizationName || 'unknown';
+        } else {
+            return res.status(400).json({ error: 'Single airtime is only available for drivers and retailers. User not found in either collection.' });
+        }
+        
+        // Validate userType if provided
+        if (userType && userType !== detectedUserType) {
+            console.warn(`User type mismatch: expected ${userType}, detected ${detectedUserType} for userId: ${userId}`);
+        }
+        
+        // Deduct wallet balance before sending airtime
+        await firestore.runTransaction(async (tx) => {
+            const userDoc = await tx.get(userRef);
+            if (!userDoc.exists) {
+                throw new Error('User not found.');
+            }
+            const currentBalance = userData.walletBalance || 0;
+            if (currentBalance < totalAmount) {
+                throw new Error('Insufficient wallet balance.');
+            }
+            tx.update(userRef, {
+                walletBalance: FieldValue.increment(-totalAmount),
+                lastWalletUpdate: FieldValue.serverTimestamp()
+            });
+        });
+    } catch (err) {
+        console.error('Single airtime wallet deduction error:', err);
+        return res.status(400).json({ error: err.message || 'Failed to deduct wallet balance.' });
+    }
+
+    // Send airtime
+    let status = 'FAILED';
+    let message = '';
+    let dispatchResult = null;
+    
+    try {
+        let result;
+        if (telco && telco.toLowerCase() === 'safaricom') {
+            result = await sendSafaricomAirtime(phoneNumber, amount);
+            if (result && result.status === 'SUCCESS') {
+                status = 'SUCCESS';
+                message = 'Airtime sent via Safaricom';
+            } else {
+                // Fallback to Africa's Talking
+                result = await sendAfricasTalkingAirtime(phoneNumber, amount, telco);
+                if (result && result.status === 'SUCCESS') {
+                    status = 'SUCCESS';
+                    message = 'Airtime sent via Africa\'s Talking fallback';
+                } else {
+                    message = result && result.message ? result.message : 'Both Safaricom and fallback failed';
+                }
+            }
+        } else {
+            // Non-Safaricom: use Africa's Talking
+            result = await sendAfricasTalkingAirtime(phoneNumber, amount, telco);
+            if (result && result.status === 'SUCCESS') {
+                status = 'SUCCESS';
+                message = 'Airtime sent via Africa\'s Talking';
+            } else {
+                message = result && result.message ? result.message : 'Africa\'s Talking failed';
+            }
+        }
+        dispatchResult = result;
+    } catch (err) {
+        message = err.message || 'Exception during airtime dispatch';
+    }
+
+    // Handle commission for drivers on successful airtime sends
+    if (status === 'SUCCESS') {
+
+        // --- NEW COMMISSION LOGIC ---
+        let commissionAmount = 0;
+        let commissionPercentage = 0;
+
+        if (detectedUserType === 'driver') {
+            try {
+                const commissionSettingsDoc = await firestore.collection('airtime_bonuses').doc('current_settings').get();
+                if (commissionSettingsDoc.exists) {
+                    const settings = commissionSettingsDoc.data();
+                    if (telco.toLowerCase() === 'safaricom') {
+                        commissionPercentage = settings.safaricomPercentage || 0;
+                    } else {
+                        commissionPercentage = settings.africastalkingPercentage || 0;
+                    }
+                } else {
+                    logger.warn(`⚠️ airtime_bonuses/current_settings document not found. Commission will be 0.`);
+                }
+                commissionAmount = amount * (commissionPercentage / 100);
+
+                if (commissionAmount > 0) {
+                    await userRef.update({
+                        walletBalance: FieldValue.increment(commissionAmount),
+                        commissionEarned: FieldValue.increment(commissionAmount),
+                        lastCommissionUpdate: FieldValue.serverTimestamp()
+                    });
+                    logger.info(`✅ Commission of ${commissionAmount} awarded to driver ${userId} for single airtime sale.`);
+                }
+            } catch (err) {
+                logger.error(`❌ Failed to award commission to driver ${userId}: ${err.message}`);
+            }
+        }
+        // --- END OF NEW COMMISSION LOGIC ---
+
+        // Create single sale record for successful airtime sends
+        const saleId = `SINGLE_SALE_${Date.now()}`;
+        logger.info(`🔄 Attempting to write single sale for ${detectedUserType}: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`);
+        
+        try {
+            await singleSalesCollection.doc(organizationName).collection('sales').doc(saleId).set({
+                saleId,
+                type: 'SINGLE_AIRTIME_SALE',
+                userId,
+                userType: detectedUserType,
+                organizationName,
+                phoneNumber,
+                amount,
+                telco,
+                recipientName: name || '',
+                status: 'SUCCESS',
+                message,
+                dispatchResult,
+                commissionEarned: commissionAmount,
+                commissionPercentage: commissionPercentage,
+                createdAt: FieldValue.serverTimestamp(),
+                lastUpdated: FieldValue.serverTimestamp()
+            });
+            logger.info(`✅ Successfully wrote single sale for ${detectedUserType}: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`);
+        } catch (err) {
+            logger.error(`❌ Failed to write single sale for ${detectedUserType}: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`, { 
+                error: err.message, 
+                stack: err.stack,
+                organizationName,
+                saleId,
+                phoneNumber,
+                amount,
+                userId,
+                userType: detectedUserType
+            });
+        }
+    } else {
+        // --- REFUNDING LOGIC (UNCOMMENTED) ---
+        try {
+            await userRef.update({
+                walletBalance: FieldValue.increment(totalAmount), // Refund the deducted amount
+                lastWalletUpdate: FieldValue.serverTimestamp()
+            });
+            logger.info(`✅ Wallet refunded for failed single airtime send - userId: ${userId}, refundedAmount: ${totalAmount}`);
+        } catch (refundErr) {
+            logger.error(`❌ Failed to refund wallet for failed single airtime send - userId: ${userId}: ${refundErr.message}`);
+        }
+        // --- END REFUNDING LOGIC ---
+        logger.warn(`⚠️ Skipping single sale write for failed airtime send - phoneNumber: ${phoneNumber}, status: ${status}, message: ${message}`);
+    }
+
+    res.json({ 
+        success: status === 'SUCCESS',
+        status,
+        message,
         phoneNumber,
         amount,
         telco,
-        recipientName: name || '',
-        status: 'SUCCESS',
-        message,
-        dispatchResult,
-        createdAt: FieldValue.serverTimestamp(),
-        lastUpdated: FieldValue.serverTimestamp()
-      });
-      logger.info(`✅ Successfully wrote single sale for ${detectedUserType}: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`);
-    } catch (err) {
-      logger.error(`❌ Failed to write single sale for ${detectedUserType}: ${organizationName}, saleId: ${saleId}, phoneNumber: ${phoneNumber}, amount: ${amount}`, { 
-        error: err.message, 
-        stack: err.stack,
-        organizationName,
-        saleId,
-        phoneNumber,
-        amount,
-        userId,
         userType: detectedUserType
-      });
-    }
-  } else {
-    logger.warn(`⚠️ Skipping single sale write for failed airtime send - phoneNumber: ${phoneNumber}, status: ${status}, message: ${message}`);
-  }
-
-  res.json({ 
-    success: status === 'SUCCESS',
-    status,
-    message,
-    phoneNumber,
-    amount,
-    telco,
-    userType: detectedUserType
-  });
-}); 
-
+    });
+});
 // --- ADMIN BULK OPERATIONS ENDPOINTS ---
 
 // --- ADMIN BULK ENDPOINTS (CORPORATE USERS ONLY) ---
