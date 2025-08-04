@@ -3579,22 +3579,20 @@ function generateTimestamp() {
 // This endpoint was removed because it was processing airtime synchronously
 // and only logging to bulk_airtime_logs without creating bulk_sales records.
 // The queue-based endpoint below handles bulk airtime properly.
-
 // --- BULK AIRTIME QUEUE ENDPOINTS ---
 // 1. Submit a bulk airtime job
+
 app.post('/api/bulk-airtime', async (req, res) => {
-  const { payload } = req.body;
-  const { requests, totalAmount, userId } = payload || {};
-  logger.info(`🔍 Incoming bulk-airtime payload: ${JSON.stringify(req.body)}`);
+  const { requests, totalAmount, userId } = req.body;
+ logger.info(`🔍 Incoming bulk-airtime payload: ${JSON.stringify(req.body)}`);
 
   if (!Array.isArray(requests) || requests.length === 0 || !totalAmount || !userId) {
     return res.status(400).json({ error: 'Missing required fields.' });
   }
 
-  // Fetch discount percentages from Firestore
+  // Fetch discounts
   let safaricomPct = 10, africastalkingPct = 2;
   try {
-    // Adjust these Firestore paths to match your structure
     const safDoc = await firestore.collection('airtime_bonuses').doc('current_settings').get();
     if (safDoc.exists) {
       const safData = safDoc.data();
@@ -3602,34 +3600,35 @@ app.post('/api/bulk-airtime', async (req, res) => {
       if (safData.africastalkingPercentage !== undefined) africastalkingPct = Number(safData.africastalkingPercentage);
     }
   } catch (err) {
-    // fallback to defaults
+    logger.warn('⚠️ Failed to fetch discount settings. Using defaults.');
   }
 
-  // Calculate discounted total
+  // Calculate backend discounted total
   const discountedTotal = requests.reduce((sum, r) => {
     const telco = (r.telco || '').toLowerCase();
-    const amt = Number(r.amount || 0);
+    const amount = Number(r.amount || 0);
+
     if (telco === 'safaricom') {
-      return sum + (amt - (amt * safaricomPct / 100));
+      return sum + (amount - (amount * safaricomPct / 100));
     } else if (['airtel', 'telkom', 'equitel', 'faiba'].includes(telco)) {
-      return sum + (amt - (amt * africastalkingPct / 100));
+      return sum + (amount - (amount * africastalkingPct / 100));
     } else {
-      return sum + amt; // fallback, no discount
+      return sum + amount;
     }
   }, 0);
 
-  // Validate totalAmount matches discountedTotal
+  // Validate totalAmount from frontend
   if (Math.abs(Number(totalAmount) - discountedTotal) > 0.01) {
+    logger.warn(`❌ Discount mismatch - client: ${totalAmount}, server: ${discountedTotal}`);
     return res.status(400).json({ error: 'totalAmount does not match discounted sum of request amounts.' });
   }
 
-  // Get user data to extract organization name and check wallet balance
+  // Fetch organization data
   let organizationName = 'unknown';
-  let userData = null;
   let userRef = null;
+  let userData = null;
 
   try {
-    // Bulk airtime is only for organisations
     const organisationsDoc = await firestore.collection('organisations').doc(userId).get();
 
     if (!organisationsDoc.exists) {
@@ -3640,18 +3639,19 @@ app.post('/api/bulk-airtime', async (req, res) => {
     userRef = organisationsDoc.ref;
     organizationName = userData.organizationName || userData.orgName || 'unknown';
 
-    // Check wallet balance
     const currentBalance = userData.walletBalance || 0;
     if (currentBalance < discountedTotal) {
       return res.status(400).json({ error: 'Insufficient wallet balance.' });
     }
-    logger.info(`✅ Wallet balance check passed - userId: ${userId}, currentBalance: ${currentBalance}, requiredAmount: ${discountedTotal}`);
+
+    logger.info(`✅ Wallet check passed: userId=${userId}, balance=${currentBalance}, required=${discountedTotal}`);
   } catch (err) {
-    console.error('Bulk airtime wallet balance check error:', err);
+    logger.error('❌ Wallet balance check error:', err);
     return res.status(400).json({ error: err.message || 'Failed to check wallet balance.' });
   }
 
   try {
+    // Save job
     const jobDoc = await bulkAirtimeJobsCollection.add({
       userId,
       organizationName,
@@ -3664,42 +3664,29 @@ app.post('/api/bulk-airtime', async (req, res) => {
       currentIndex: 0
     });
 
-    // Create bulk transaction record
+    // Save transaction
     const bulkTransactionId = `BULK_${Date.now()}_${jobDoc.id}`;
-    logger.info(`🔄 Creating bulk transaction - userId: ${userId}, organizationName: ${organizationName}, totalAmount: ${discountedTotal}, requestCount: ${requests.length}`);
+    await bulkTransactionsCollection.doc(bulkTransactionId).set({
+      transactionID: bulkTransactionId,
+      type: 'BULK_AIRTIME_PURCHASE',
+      userId,
+      organizationName,
+      totalAmount: discountedTotal,
+      requestCount: requests.length,
+      status: 'PENDING_PROCESSING',
+      jobId: jobDoc.id,
+      createdAt: FieldValue.serverTimestamp(),
+      lastUpdated: FieldValue.serverTimestamp(),
+      actualAmountCharged: 0,
+      successfulCount: 0,
+      failedCount: 0
+    });
 
-    try {
-      await bulkTransactionsCollection.doc(bulkTransactionId).set({
-        transactionID: bulkTransactionId,
-        type: 'BULK_AIRTIME_PURCHASE',
-        userId,
-        organizationName,
-        totalAmount: discountedTotal,
-        requestCount: requests.length,
-        status: 'PENDING_PROCESSING',
-        jobId: jobDoc.id,
-        createdAt: FieldValue.serverTimestamp(),
-        lastUpdated: FieldValue.serverTimestamp(),
-        actualAmountCharged: 0, // Will be updated when job completes
-        successfulCount: 0, // Will be updated when job completes
-        failedCount: 0 // Will be updated when job completes
-      });
-      logger.info(`✅ Successfully created bulk transaction: ${bulkTransactionId} for org: ${organizationName}`);
-    } catch (err) {
-      logger.error(`❌ Failed to create bulk transaction for userId: ${userId}, organizationName: ${organizationName}`, { 
-        error: err.message, 
-        stack: err.stack,
-        userId,
-        organizationName,
-        totalAmount: discountedTotal,
-        requestCount: requests.length
-      });
-    }
-
+    logger.info(`✅ Bulk airtime job + transaction created. JobId: ${jobDoc.id}, Amount Charged: ${discountedTotal}`);
     res.json({ jobId: jobDoc.id, bulkTransactionId });
   } catch (err) {
-    console.error('Failed to create bulk airtime job:', err);
-    res.status(500).json({ error: 'Failed to create job.' });
+    logger.error('❌ Failed to create bulk airtime job or transaction:', err);
+    res.status(500).json({ error: 'Failed to create bulk airtime job.' });
   }
 });
 
