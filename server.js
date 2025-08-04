@@ -3585,7 +3585,7 @@ function generateTimestamp() {
 app.post('/api/bulk-airtime', async (req, res) => {
   const { payload } = req.body;
   const { requests, totalAmount, userId } = payload || {};
-  logger.info('🔍 Incoming bulk-airtime payload', { payload: req.body });
+  logger.info(`🔍 Incoming bulk-airtime payload: ${JSON.stringify(req.body)}`);
 
   if (!Array.isArray(requests) || requests.length === 0 || !totalAmount || !userId) {
     return res.status(400).json({ error: 'Missing required fields.' });
