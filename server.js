@@ -3870,9 +3870,11 @@ async function processBulkAirtimeJobs() {
       }
       // If all done, mark as completed and deduct wallet for successful sends
       if (currentIndex >= requests.length) {
-        // Calculate total amount for successful sends only
         const successfulResults = results.filter(r => r.status === 'SUCCESS');
-        const totalSuccessfulAmount = successfulResults.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+        
+        // START OF FIX
+        const totalSuccessfulAmount = totalAmount; 
+        // END OF FIX
         
         // Check if wallet has already been deducted for this job
         const jobData = await bulkAirtimeJobsCollection.doc(jobId).get();
