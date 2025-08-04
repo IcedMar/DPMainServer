@@ -3581,9 +3581,9 @@ function generateTimestamp() {
 // 1. Submit a bulk airtime job
 app.post('/api/bulk-airtime', async (req, res) => {
   const { requests, totalAmount, userId } = req.body;
-  if (!Array.isArray(requests) || requests.length === 0 || !totalAmount || !userId) {
-    return res.status(400).json({ error: 'Missing required fields.' });
-  }
+  //if (!Array.isArray(requests) || requests.length === 0 || !totalAmount || !userId) {
+    //return res.status(400).json({ error: 'Missing required fields.' });
+  //}
 
   // Fetch discount percentages from Firestore
   let safaricomPct = 10, africastalkingPct = 2;
