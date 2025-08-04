@@ -89,6 +89,9 @@ function hashString(str) {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 // Trust proxy for rate limiting to work correctly with load balancers
 app.set('trust proxy', 1);
 
@@ -3581,6 +3584,7 @@ function generateTimestamp() {
 // 1. Submit a bulk airtime job
 app.post('/api/bulk-airtime', async (req, res) => {
   const { requests, totalAmount, userId } = req.body;
+  logger.info('🔍 Incoming bulk-airtime payload', { payload: req.body });
   //if (!Array.isArray(requests) || requests.length === 0 || !totalAmount || !userId) {
     //return res.status(400).json({ error: 'Missing required fields.' });
   //}
