@@ -2154,13 +2154,25 @@ app.post('/c2b-confirmation', async (req, res) => {
                     }
                     
                     if (airtimeResult && airtimeResult.status === 'SUCCESS') {
-                        // Award commission to driver
-                        const commissionDoc = await firestore.collection('wallet_bonuses').doc('drivers_comm').get();
-                        const commissionPercentage = commissionDoc.exists ? commissionDoc.data().percentage || 0 : 0;
-                        const commissionAmount = amount * (commissionPercentage / 100);
-                        
-                        logger.info(`💰 Driver commission calculation - driverId: ${driverId}, amount: ${amount}, commissionPercentage: ${commissionPercentage}%, commissionAmount: ${commissionAmount}`);
-                        
+                        // --- START OF NEW COMMISSION LOGIC ---
+                        let commissionPercentage = 0;
+                        const commissionSettingsDoc = await firestore.collection('airtime_bonuses').doc('current_settings').get();
+    
+                      if (commissionSettingsDoc.exists) {
+                          const settings = commissionSettingsDoc.data();
+                          if (carrier === 'Safaricom') {
+                              commissionPercentage = settings.safaricomPercentage || 0;
+                          } else {
+                              commissionPercentage = settings.africastalkingPercentage || 0;
+                            }
+                      } else {
+                          logger.warn(`⚠️ airtime_bonuses/current_settings document not found. Commission will be 0.`);
+                          }
+
+                      const commissionAmount = amount * (commissionPercentage / 100);
+    
+                        logger.info(`💰 Driver commission calculation - driverId: ${driverId}, amount: ${amount}, carrier: ${carrier}, commissionPercentage: ${commissionPercentage}%, commissionAmount: ${commissionAmount}`);
+    
                         if (commissionAmount > 0) {
                             await userRef.update({
                                 commissionEarned: FieldValue.increment(commissionAmount),
@@ -3210,185 +3222,219 @@ app.post('/api/driver-commission/topup-wallet', async (req, res) => {
   }
 });
 
+
 // 7. Sell Airtime (Wallet or Customer)
 app.post('/api/driver-airtime/sell', async (req, res) => {
-  const { driverId, amount, recipientPhone, paymentMethod, customerPhone } = req.body;
+  const { driverId, amount, recipientPhone, paymentMethod, customerPhone } = req.body;
 
-  if (!driverId || !amount || !recipientPhone || !paymentMethod) {
-    return res.status(400).json({ 
-      success: false, 
-      message: 'Missing required fields' 
-    });
-  }
+  if (!driverId || !amount || !recipientPhone || !paymentMethod) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Missing required fields' 
+    });
+  }
 
-  if (paymentMethod === 'customer' && !customerPhone) {
-    return res.status(400).json({ 
-      success: false, 
-      message: 'Customer phone number required for customer payment method' 
-    });
-  }
+  if (paymentMethod === 'customer' && !customerPhone) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Customer phone number required for customer payment method' 
+    });
+  }
 
-  try {
-    // Verify driver exists
-    const driverRef = firestore.collection('drivers').doc(driverId);
-    const driverDoc = await driverRef.get();
-    
-    if (!driverDoc.exists) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Driver not found' 
-      });
-    }
+  try {
+    // Verify driver exists
+    const driverRef = firestore.collection('drivers').doc(driverId);
+    const driverDoc = await driverRef.get();
+    
+    if (!driverDoc.exists) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Driver not found' 
+      });
+    }
 
-    const driverData = driverDoc.data();
-    let transactionId = `DRIVER_AIRTIME_${Date.now()}_${driverId}`;
+    const driverData = driverDoc.data();
+    let transactionId = `DRIVER_AIRTIME_${Date.now()}_${driverId}`;
 
-    if (paymentMethod === 'wallet') {
-      // Check wallet balance
-      const currentBalance = driverData.walletBalance || 0;
-      if (currentBalance < amount) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Insufficient wallet balance' 
-        });
-      }
+    if (paymentMethod === 'wallet') {
+      // Check wallet balance
+      const currentBalance = driverData.walletBalance || 0;
+      if (currentBalance < amount) {
+        return res.status(400).json({ 
+          success: false, 
+          message: 'Insufficient wallet balance' 
+        });
+      }
 
-      // Deduct from wallet and send airtime
-      await firestore.runTransaction(async (tx) => {
-        const updatedDriverDoc = await tx.get(driverRef);
-        const updatedDriverData = updatedDriverDoc.data();
-        
-        if (updatedDriverData.walletBalance < amount) {
-          throw new Error('Insufficient wallet balance');
-        }
+      // Deduct from wallet and send airtime
+      await firestore.runTransaction(async (tx) => {
+        const updatedDriverDoc = await tx.get(driverRef);
+        const updatedDriverData = updatedDriverDoc.data();
+        
+        if (updatedDriverData.walletBalance < amount) {
+          throw new Error('Insufficient wallet balance');
+        }
 
-        // Deduct from wallet
-        tx.update(driverRef, {
-          walletBalance: FieldValue.increment(-amount),
-          totalTransactions: FieldValue.increment(1),
-          lastWalletUpdate: FieldValue.serverTimestamp()
-        });
-      });
+        // Deduct from wallet
+        tx.update(driverRef, {
+          walletBalance: FieldValue.increment(-amount),
+          totalTransactions: FieldValue.increment(1),
+          lastWalletUpdate: FieldValue.serverTimestamp()
+        });
+      });
 
-      // Send airtime
-      const carrier = detectCarrier(recipientPhone);
-      let airtimeResult;
-      
-      logger.info(`📱 Sending airtime via driver wallet - driverId: ${driverId}, recipientPhone: ${recipientPhone}, amount: ${amount}, carrier: ${carrier}`);
-      
-      if (carrier === 'Safaricom') {
-        airtimeResult = await sendSafaricomAirtime(recipientPhone, amount);
-      } else {
-        airtimeResult = await sendAfricasTalkingAirtime(recipientPhone, amount, carrier);
-      }
+      // Send airtime
+      const carrier = detectCarrier(recipientPhone);
+      let airtimeResult;
+      
+      logger.info(`📱 Sending airtime via driver wallet - driverId: ${driverId}, recipientPhone: ${recipientPhone}, amount: ${amount}, carrier: ${carrier}`);
+      
+      if (carrier === 'Safaricom') {
+        airtimeResult = await sendSafaricomAirtime(recipientPhone, amount);
+      } else {
+        airtimeResult = await sendAfricasTalkingAirtime(recipientPhone, amount, carrier);
+      }
 
-      logger.info(`📱 Airtime send result - driverId: ${driverId}, status: ${airtimeResult.status}, message: ${airtimeResult.message}`);
+      logger.info(`📱 Airtime send result - driverId: ${driverId}, status: ${airtimeResult.status}, message: ${airtimeResult.message}`);
 
-      if (airtimeResult.status === 'SUCCESS') {
-        // Log successful transaction in single_sales collection
-        const saleId = `DRIVER_SALE_${Date.now()}_${driverId}`;
-        await firestore.collection('single_sales').doc(driverData.username).collection('sales').doc(saleId).set({
-          driverId,
-          type: 'DRIVER_AIRTIME_SALE',
-          amount: amount,
-          recipientPhone,
-          carrier,
-          commissionEarned: 0, // No commission for wallet sales
-          status: 'SUCCESS',
-          transactionId,
-          paymentMethod: 'wallet',
-          createdAt: FieldValue.serverTimestamp()
-        });
+      if (airtimeResult.status === 'SUCCESS') {
+        // --- START OF COMMISSION LOGIC FOR WALLET SALES ---
+        let commissionPercentage = 0;
+        const commissionSettingsDoc = await firestore.collection('airtime_bonuses').doc('current_settings').get();
+        
+        if (commissionSettingsDoc.exists) {
+            const settings = commissionSettingsDoc.data();
+            if (carrier === 'Safaricom') {
+                commissionPercentage = settings.safaricomPercentage || 0;
+            } else {
+                commissionPercentage = settings.africastalkingPercentage || 0;
+            }
+        } else {
+            logger.warn(`⚠️ airtime_bonuses/current_settings document not found. Commission will be 0.`);
+        }
 
-        res.json({
-          success: true,
-          message: 'Airtime sent successfully',
-          transactionId,
-          commissionEarned: 0, // No commission for wallet sales
-          commissionPercentage: 0
-        });
-      } else {
-        // Refund wallet if airtime failed
-        await driverRef.update({
-          walletBalance: FieldValue.increment(amount),
-          totalTransactions: FieldValue.increment(-1)
-        });
+        const commissionAmount = amount * (commissionPercentage / 100);
+        
+        logger.info(`💰 Driver wallet sale commission calculation - driverId: ${driverId}, amount: ${amount}, carrier: ${carrier}, commissionPercentage: ${commissionPercentage}%, commissionAmount: ${commissionAmount}`);
 
-        res.json({
-          success: false,
-          message: 'Failed to send airtime',
-          transactionId
-        });
-      }
-    } else if (paymentMethod === 'customer') {
-      // Initiate STK Push to customer
-      const timestamp = generateTimestamp();
-      const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
-      const token = await getAccessToken();
+        if (commissionAmount > 0) {
+            // Credit commission to driver's wallet (or a separate commission balance)
+            // Assuming you want to add it to walletBalance for simplicity,
+            // but you might have a dedicated 'commissionBalance' field.
+            await driverRef.update({
+                walletBalance: FieldValue.increment(commissionAmount), // Add commission back to wallet
+                commissionEarned: FieldValue.increment(commissionAmount), // Track total commission earned
+                lastCommissionUpdate: FieldValue.serverTimestamp()
+            });
+            logger.info(`✅ Commission awarded to driver ${driverId} for wallet sale: ${commissionAmount}`);
+        }
+        // --- END OF COMMISSION LOGIC FOR WALLET SALES ---
 
-      // Use driverUsername as AccountReference (truncated if needed)
-      const driverUsername = req.body.driverUsername || driverData.username || 'driver';
-      const truncatedAccountRef = driverUsername.length > 20 ? driverUsername.substring(0, 20) : driverUsername;
-      
-      logger.info(`📝 Driver STK Push - driverUsername: ${driverUsername}, truncated: ${truncatedAccountRef}`);
-      
-      const payload = {
-        BusinessShortCode: SHORTCODE,
-        Password: password,
-        Timestamp: timestamp,
-        TransactionType: 'CustomerPayBillOnline',
-        Amount: Number(amount),
-        PartyA: customerPhone,
-        PartyB: SHORTCODE,
-        PhoneNumber: customerPhone,
-        CallBackURL: STK_CALLBACK_URL,
-        AccountReference: truncatedAccountRef,
-        TransactionDesc: 'Driver Airtime Sale'
-      };
+        // Log successful transaction in single_sales collection
+        const saleId = `DRIVER_SALE_${Date.now()}_${driverId}`;
+        await firestore.collection('single_sales').doc(driverData.username).collection('sales').doc(saleId).set({
+          driverId,
+          type: 'DRIVER_AIRTIME_SALE_WALLET', // Changed type for clarity
+          amount: amount,
+          recipientPhone,
+          carrier,
+          commissionEarned: commissionAmount, // Now correctly set
+          commissionPercentage: commissionPercentage, // Added commission percentage
+          status: 'SUCCESS',
+          transactionId,
+          paymentMethod: 'wallet',
+          createdAt: FieldValue.serverTimestamp()
+        });
 
-      const stkRes = await axios.post(
-        'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
-        payload,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
+        res.json({
+          success: true,
+          message: 'Airtime sent successfully',
+          transactionId,
+          commissionEarned: commissionAmount, // Now correctly set
+          commissionPercentage: commissionPercentage // Now correctly set
+        });
+      } else {
+        // Refund wallet if airtime failed
+        await driverRef.update({
+          walletBalance: FieldValue.increment(amount),
+          totalTransactions: FieldValue.increment(-1)
+        });
 
-      // Log pending transaction with recipient phone for C2B retrieval in single_sales collection
-      const saleId = `DRIVER_SALE_${Date.now()}_${driverId}`;
-      await firestore.collection('single_sales').doc(driverData.username).collection('sales').doc(saleId).set({
-        driverId,
-        type: 'DRIVER_AIRTIME_SALE_PENDING',
-        amount: amount,
-        recipientPhone,
-        customerPhone,
-        status: 'PENDING',
-        transactionId,
-        merchantRequestID: stkRes.data.MerchantRequestID,
-        checkoutRequestID: stkRes.data.CheckoutRequestID,
-        driverUsername: driverData.username,
-        paymentMethod: 'customer',
-        createdAt: FieldValue.serverTimestamp()
-      });
+        res.json({
+          success: false,
+          message: 'Failed to send airtime',
+          transactionId
+        });
+      }
+    } else if (paymentMethod === 'customer') {
+      // Initiate STK Push to customer
+      const timestamp = generateTimestamp();
+      const password = generatePassword(SHORTCODE, PASSKEY, timestamp);
+      const token = await getAccessToken();
 
-      res.json({
-        success: true,
-        message: 'STK Push initiated for customer payment',
-        transactionId,
-        merchantRequestID: stkRes.data.MerchantRequestID,
-        checkoutRequestID: stkRes.data.CheckoutRequestID
-      });
-    }
-  } catch (error) {
-    logger.error('Driver airtime sale error:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: error.message || 'Failed to process airtime sale' 
-    });
-  }
+      // Use driverUsername as AccountReference (truncated if needed)
+      const driverUsername = req.body.driverUsername || driverData.username || 'driver';
+      const truncatedAccountRef = driverUsername.length > 20 ? driverUsername.substring(0, 20) : driverUsername;
+      
+      logger.info(`📝 Driver STK Push - driverUsername: ${driverUsername}, truncated: ${truncatedAccountRef}`);
+      
+      const payload = {
+        BusinessShortCode: SHORTCODE,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: 'CustomerPayBillOnline',
+        Amount: Number(amount),
+        PartyA: customerPhone,
+        PartyB: SHORTCODE,
+        PhoneNumber: customerPhone,
+        CallBackURL: STK_CALLBACK_URL,
+        AccountReference: truncatedAccountRef,
+        TransactionDesc: 'Driver Airtime Sale'
+      };
+
+      const stkRes = await axios.post(
+        'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+        payload,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      // Log pending transaction with recipient phone for C2B retrieval in single_sales collection
+      const saleId = `DRIVER_SALE_${Date.now()}_${driverId}`;
+      await firestore.collection('single_sales').doc(driverData.username).collection('sales').doc(saleId).set({
+        driverId,
+        type: 'DRIVER_AIRTIME_SALE_PENDING',
+        amount: amount,
+        recipientPhone,
+        customerPhone,
+        status: 'PENDING',
+        transactionId,
+        merchantRequestID: stkRes.data.MerchantRequestID,
+        checkoutRequestID: stkRes.data.CheckoutRequestID,
+        driverUsername: driverData.username,
+        paymentMethod: 'customer',
+        createdAt: FieldValue.serverTimestamp()
+      });
+
+      res.json({
+        success: true,
+        message: 'STK Push initiated for customer payment',
+        transactionId,
+        merchantRequestID: stkRes.data.MerchantRequestID,
+        checkoutRequestID: stkRes.data.CheckoutRequestID
+      });
+    }
+  } catch (error) {
+    logger.error('Driver airtime sale error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message || 'Failed to process airtime sale' 
+    });
+  }
 });
 
 // 8.5. Check/Set Driver Commission Percentage
