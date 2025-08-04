@@ -3584,35 +3584,62 @@ app.post('/api/bulk-airtime', async (req, res) => {
   if (!Array.isArray(requests) || requests.length === 0 || !totalAmount || !userId) {
     return res.status(400).json({ error: 'Missing required fields.' });
   }
-  // Validate totalAmount matches sum of all amounts
-  const sumAmounts = requests.reduce((sum, r) => sum + Number(r.amount || 0), 0);
-  if (Number(totalAmount) !== sumAmounts) {
-    return res.status(400).json({ error: 'totalAmount does not match sum of request amounts.' });
+
+  // Fetch discount percentages from Firestore
+  let safaricomPct = 10, africastalkingPct = 2;
+  try {
+    // Adjust these Firestore paths to match your structure
+    const safDoc = await firestore.collection('airtime_bonuses').doc('current_settings').get();
+    if (safDoc.exists) {
+      const safData = safDoc.data();
+      if (safData.safaricomPercentage !== undefined) safaricomPct = Number(safData.safaricomPercentage);
+      if (safData.africastalkingPercentage !== undefined) africastalkingPct = Number(safData.africastalkingPercentage);
+    }
+  } catch (err) {
+    // fallback to defaults
+  }
+
+  // Calculate discounted total
+  const discountedTotal = requests.reduce((sum, r) => {
+    const telco = (r.telco || '').toLowerCase();
+    const amt = Number(r.amount || 0);
+    if (telco === 'safaricom') {
+      return sum + (amt - (amt * safaricomPct / 100));
+    } else if (['airtel', 'telkom', 'equitel', 'faiba'].includes(telco)) {
+      return sum + (amt - (amt * africastalkingPct / 100));
+    } else {
+      return sum + amt; // fallback, no discount
+    }
+  }, 0);
+
+  // Validate totalAmount matches discountedTotal
+  if (Math.abs(Number(totalAmount) - discountedTotal) > 0.01) {
+    return res.status(400).json({ error: 'totalAmount does not match discounted sum of request amounts.' });
   }
 
   // Get user data to extract organization name and check wallet balance
   let organizationName = 'unknown';
   let userData = null;
   let userRef = null;
-  
+
   try {
     // Bulk airtime is only for organisations
     const organisationsDoc = await firestore.collection('organisations').doc(userId).get();
-    
+
     if (!organisationsDoc.exists) {
       return res.status(400).json({ error: 'Bulk airtime is only available for organisations. User not found in organisations collection.' });
     }
-    
+
     userData = organisationsDoc.data();
     userRef = organisationsDoc.ref;
     organizationName = userData.organizationName || userData.orgName || 'unknown';
-    
+
     // Check wallet balance
     const currentBalance = userData.walletBalance || 0;
-    if (currentBalance < totalAmount) {
+    if (currentBalance < discountedTotal) {
       return res.status(400).json({ error: 'Insufficient wallet balance.' });
     }
-    logger.info(`✅ Wallet balance check passed - userId: ${userId}, currentBalance: ${currentBalance}, requiredAmount: ${totalAmount}`);
+    logger.info(`✅ Wallet balance check passed - userId: ${userId}, currentBalance: ${currentBalance}, requiredAmount: ${discountedTotal}`);
   } catch (err) {
     console.error('Bulk airtime wallet balance check error:', err);
     return res.status(400).json({ error: err.message || 'Failed to check wallet balance.' });
@@ -3623,7 +3650,7 @@ app.post('/api/bulk-airtime', async (req, res) => {
       userId,
       organizationName,
       requests,
-      totalAmount,
+      totalAmount: discountedTotal,
       status: 'pending',
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
@@ -3633,15 +3660,15 @@ app.post('/api/bulk-airtime', async (req, res) => {
 
     // Create bulk transaction record
     const bulkTransactionId = `BULK_${Date.now()}_${jobDoc.id}`;
-    logger.info(`🔄 Creating bulk transaction - userId: ${userId}, organizationName: ${organizationName}, totalAmount: ${totalAmount}, requestCount: ${requests.length}`);
-    
+    logger.info(`🔄 Creating bulk transaction - userId: ${userId}, organizationName: ${organizationName}, totalAmount: ${discountedTotal}, requestCount: ${requests.length}`);
+
     try {
       await bulkTransactionsCollection.doc(bulkTransactionId).set({
         transactionID: bulkTransactionId,
         type: 'BULK_AIRTIME_PURCHASE',
         userId,
         organizationName,
-        totalAmount,
+        totalAmount: discountedTotal,
         requestCount: requests.length,
         status: 'PENDING_PROCESSING',
         jobId: jobDoc.id,
@@ -3658,7 +3685,7 @@ app.post('/api/bulk-airtime', async (req, res) => {
         stack: err.stack,
         userId,
         organizationName,
-        totalAmount,
+        totalAmount: discountedTotal,
         requestCount: requests.length
       });
     }
